@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*\.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+*.spec
+*.whl
+
+# Virtual Environment
+venv/
+.venv/
+env/
+packages/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+crash.log
+
+# PyInstaller
+*.manifest
+*.exe
+
+# Temporary files
+*.tmp
+*.bak
