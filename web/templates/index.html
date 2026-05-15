@@ -46,17 +46,28 @@
         }
 
         /* ========== Layui Tab 主题色覆盖 ========== */
+        .layui-tab-title li,
+        .layui-tab-title li a {
+            color: #555 !important;
+            transition: color 0.2s;
+        }
+        .layui-tab-title li a:hover {
+            color: var(--primary) !important;
+        }
+        /* 选中Tab：深色背景 + 白色文字 */
         .layui-tab-title .layui-this {
-            color: #333 !important;
+            background: var(--primary) !important;
+            border-radius: 6px 6px 0 0;
+        }
+        .layui-tab-title .layui-this,
+        .layui-tab-title .layui-this a,
+        .layui-tab-title .layui-this a span,
+        .layui-tab-title .layui-this i {
+            color: #ffffff !important;
+            font-weight: 600 !important;
         }
         .layui-tab-title .layui-this::after {
-            background: var(--primary) !important;
-        }
-        .layui-tab-brief > .layui-tab-title .layui-this a {
-            color: #333 !important;
-        }
-        .layui-tab-title li a {
-            color: #333 !important;
+            background: transparent !important;
         }
 
         /* ========== 上传拖拽区域 ========== */
