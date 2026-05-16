@@ -45,7 +45,7 @@ class BlinkDetector(BaseDetector):
                 max_num_faces=5,
                 refine_landmarks=True,
                 min_detection_confidence=0.5,
-                min_tracking_confidence=0.5,
+                min_tracking_confidence=0.15,
             )
         return self._face_mesh
 
