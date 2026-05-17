@@ -1215,6 +1215,8 @@ class DesktopApp(QMainWindow):
 
         if is_defective:
             menu.addSeparator()
+            action_mark_normal = menu.addAction("标记为正常（移出废片）")
+            action_mark_normal.triggered.connect(lambda: self._mark_as_normal(path))
             action_move_single = menu.addAction("单独移动此废片")
             action_move_single.triggered.connect(lambda: self._move_single_defective(path))
 
@@ -1262,6 +1264,66 @@ class DesktopApp(QMainWindow):
             self.status_bar.showMessage("路径已复制到剪贴板", 3000)
         except Exception:
             pass
+
+    def _mark_as_normal(self, path: str):
+        """将废片标记为正常（手动审核移出废片列表）"""
+        if not path or path not in self.scan_results:
+            return
+
+        reply = QMessageBox.question(
+            self, "确认标记",
+            f"确定要将此照片从废片列表中移除？\n\n"
+            f"文件: {os.path.basename(path)}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            # 将所有检测结果标记为非缺陷
+            for result in self.scan_results[path]:
+                result.is_defective = False
+
+            # 从废片列表移到此项目
+            self._move_item_between_lists(path, from_defective=True)
+            self.status_bar.showMessage(f"已移出废片: {os.path.basename(path)}", 3000)
+
+    def _move_item_between_lists(self, path: str, from_defective: bool):
+        """在废片列表和正常列表之间移动项目"""
+        src_list = self.defective_list if from_defective else self.normal_list
+        dst_list = self.normal_list if from_defective else self.defective_list
+
+        # 找到对应的 QListWidgetItem
+        for i in range(src_list.count()):
+            item = src_list.item(i)
+            if item and item.data(Qt.UserRole) == path:
+                src_list.takeItem(i)
+                thumbnail = self._generate_thumbnail(path)
+                if from_defective:
+                    dst_list.add_photo(path, thumbnail)
+                else:
+                    # 如果是移回废片，需要一个标签显示缺陷类型
+                    defects = [d for d in self.scan_results[path] if d.is_defective]
+                    if defects:
+                        main_defect = max(defects, key=lambda d: d.confidence)
+                        dtype_name = DEFECT_TYPE_NAMES.get(main_defect.defect_type, "未知")
+                        label = f"[{dtype_name}] {os.path.basename(path)}"
+                        dst_list.add_photo(path, thumbnail, label)
+                    else:
+                        dst_list.add_photo(path, thumbnail)
+                break
+
+        # 更新计数
+        self._update_counts()
+
+    def _update_counts(self):
+        """更新正常照片和废片的计数"""
+        normal_count = self.normal_list.count()
+        defective_count = self.defective_list.count()
+        self.normal_count_label.setText(f"共 {normal_count} 张")
+        self.defective_count_label.setText(f"共 {defective_count} 张")
+        total = normal_count + defective_count
+        self.status_bar.showMessage(
+            f"共 {total} 张, 正常 {normal_count} 张, 废片 {defective_count} 张"
+        )
 
     def _move_single_defective(self, path: str):
         """单独移动一张废片"""

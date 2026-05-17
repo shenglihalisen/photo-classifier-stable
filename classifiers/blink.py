@@ -4,8 +4,11 @@
 使用 MediaPipe Face Mesh 检测人脸，通过 Eye Aspect Ratio (EAR) 判断是否闭眼
 """
 
+import os
 import cv2
 import numpy as np
+
+import mediapipe as mp
 
 from .base import BaseDetector, DetectionResult, DefectType
 
@@ -30,23 +33,28 @@ class BlinkDetector(BaseDetector):
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
     def __init__(self):
-        self._face_mesh = None
+        self._face_landmarker = None
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.BLINK
 
-    def _get_face_mesh(self):
-        """延迟初始化 MediaPipe Face Mesh"""
-        if self._face_mesh is None:
-            import mediapipe as mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=5,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
+    def _get_face_landmarker(self):
+        if self._face_landmarker is None:
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+            with open(model_path, "rb") as f:
+                model_data = f.read()
+            self._face_landmarker = vision.FaceLandmarker.create_from_options(
+                vision.FaceLandmarkerOptions(
+                    base_options=python.BaseOptions(model_asset_buffer=model_data),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_faces=5,
+                    min_face_detection_confidence=0.5,
+                )
             )
-        return self._face_mesh
+        return self._face_landmarker
 
     def detect(self, image_path: str) -> DetectionResult:
         """检测图片中是否有人闭眼"""
@@ -61,11 +69,11 @@ class BlinkDetector(BaseDetector):
                 )
 
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            face_mesh = self._get_face_mesh()
-            results = face_mesh.process(rgb_img)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
+            face_landmarker = self._get_face_landmarker()
+            detection_result = face_landmarker.detect(image)
 
-            # 无人脸检测到，不判定为废片
-            if not results.multi_face_landmarks:
+            if not detection_result.face_landmarks:
                 return DetectionResult(
                     is_defective=False,
                     defect_type=None,
@@ -73,14 +81,13 @@ class BlinkDetector(BaseDetector):
                     description="未检测到人脸，跳过闭眼检测"
                 )
 
-            face_count = len(results.multi_face_landmarks)
+            face_count = len(detection_result.face_landmarks)
             blink_faces = []
             min_ear = 1.0
 
-            for face_idx, face_landmarks in enumerate(results.multi_face_landmarks):
+            for face_idx, face_landmarks in enumerate(detection_result.face_landmarks):
                 h, w = img.shape[:2]
 
-                # 提取左眼和右眼关键点
                 left_eye_pts = self._get_eye_points(face_landmarks, self.LEFT_EYE_INDICES, w, h)
                 right_eye_pts = self._get_eye_points(face_landmarks, self.RIGHT_EYE_INDICES, w, h)
 
@@ -120,21 +127,9 @@ class BlinkDetector(BaseDetector):
             )
 
     def _get_eye_points(self, face_landmarks, indices: list, width: int, height: int) -> np.ndarray:
-        """
-        从人脸关键点中提取眼部坐标
-
-        参数:
-            face_landmarks: MediaPipe 人脸关键点
-            indices: 眼部关键点索引列表
-            width: 图像宽度
-            height: 图像高度
-
-        返回:
-            shape=(6, 2) 的 numpy 数组，每行为 (x, y) 坐标
-        """
         points = []
         for idx in indices:
-            landmark = face_landmarks.landmark[idx]
+            landmark = face_landmarks[idx]
             x = landmark.x * width
             y = landmark.y * height
             points.append([x, y])

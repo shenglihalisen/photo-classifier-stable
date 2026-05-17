@@ -221,8 +221,8 @@ def sanitize_error_message(error: Exception) -> str:
     msg = re.sub(r'[A-Za-z]:\\[^\s:]+', '[路径已隐藏]', msg)
     msg = re.sub(r'/[^\s]+', '[路径已隐藏]', msg)
     # 移除可能的用户名
-    msg = re.sub(r'Users\\[^\\]+\\', 'Users\\[用户]\\', msg)
-    msg = re.sub(r'/home/[^/]+/', '/home/[用户]/', msg)
+    msg = re.sub(r'Users\\[^\\]+(?=\\)', '[用户]', msg)
+    msg = re.sub(r'/home/[^/]+(?=/)', '/[用户]', msg)
     return msg
 
 
@@ -476,7 +476,7 @@ class TempFileCleaner:
 # Flask 应用工厂
 # ============================================================
 
-def create_app() -> Flask:
+def create_app(_test_scan_state=None) -> Flask:
     """创建并配置 Flask 应用"""
 
     app = Flask(
@@ -495,8 +495,8 @@ def create_app() -> Flask:
     # 全局分类器实例
     classifier = PhotoClassifier()
 
-    # 扫描状态
-    scan_state = {
+    # 扫描状态（允许测试注入）
+    scan_state = _test_scan_state if _test_scan_state is not None else {
         "is_scanning": False,
         "progress": 0,
         "total": 0,
@@ -504,6 +504,7 @@ def create_app() -> Flask:
         "results": {},
         "error": None,
         "temp_dir": None,  # 存储上传文件的临时目录
+        "removed_paths": set(),  # 用户手动移除的废片路径
     }
 
     # 缩略图缓存 {path: base64_string}
@@ -823,6 +824,7 @@ def create_app() -> Flask:
         scan_state["total"] = len(image_files)
         scan_state["current_file"] = ""
         scan_state["results"] = {}
+        scan_state["removed_paths"] = set()
         scan_state["error"] = None
         scan_state["temp_dir"] = temp_dir
         thumbnail_cache.clear()
@@ -870,11 +872,18 @@ def create_app() -> Flask:
         }
 
         if not scan_state["is_scanning"] and scan_state["results"]:
-            # 扫描完成，返回分类汇总
             normal_photos = []
             defective_photos = {}
+            removed = scan_state["removed_paths"]
 
             for path, results in scan_state["results"].items():
+                if path in removed:
+                    normal_photos.append({
+                        "path": path,
+                        "filename": os.path.basename(path),
+                        "thumbnail": generate_thumbnail(path),
+                    })
+                    continue
                 defects = [r for r in results if r.is_defective]
 
                 if defects:
@@ -955,6 +964,29 @@ def create_app() -> Flask:
             "file_count": len(file_paths),
             "expires_in": DELETE_TOKEN_EXPIRE,
         })
+
+    # ========================================================
+    # 路由：API - 移除废片标记（手动审核）
+    # ========================================================
+
+    @app.route("/api/remove-defect", methods=["POST"])
+    @rate_limit
+    @csrf_protect
+    def remove_defect():
+        """将指定废片标记为正常（手动审核误判）"""
+        data = request.get_json(silent=True)
+        if not data or "path" not in data:
+            return jsonify({"error": "请提供文件路径"}), 400
+
+        file_path = data["path"]
+
+        if not scan_state["results"] or file_path not in scan_state["results"]:
+            return jsonify({"error": "文件不在扫描结果中"}), 400
+
+        scan_state["removed_paths"].add(file_path)
+        logger.info("手动移除废片标记: %s", sanitize_error_message(file_path))
+
+        return jsonify({"message": "已标记为正常", "path": file_path})
 
     # ========================================================
     # 路由：API - 处理废片

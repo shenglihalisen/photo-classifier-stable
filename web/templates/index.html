@@ -305,6 +305,35 @@
             z-index: 2;
         }
 
+        /* 移除废片按钮 */
+        .remove-defect-btn {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            width: 26px;
+            height: 26px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(255, 71, 87, 0.85);
+            color: #fff;
+            font-size: 18px;
+            line-height: 1;
+            cursor: pointer;
+            z-index: 3;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            opacity: 0;
+        }
+        .photo-card:hover .remove-defect-btn {
+            opacity: 1;
+        }
+        .remove-defect-btn:hover {
+            background: #ff4757;
+            transform: scale(1.15);
+        }
+
         /* ========== 区块标题 ========== */
         .section-heading {
             font-size: 18px;
@@ -1022,6 +1051,7 @@ layui.use(['element', 'form', 'layer'], function(){
     function createPhotoCard(photo, isDefective) {
         var card = document.createElement('div');
         card.className = 'photo-card';
+        card.setAttribute('data-path', photo.path);
 
         // 手动模式下的复选框
         if (isDefective) {
@@ -1031,6 +1061,19 @@ layui.use(['element', 'form', 'layer'], function(){
             cb.setAttribute('data-path', photo.path);
             cb.style.display = 'none';
             card.appendChild(cb);
+        }
+
+        // 移除按钮（废片专属，用于手动审核）
+        if (isDefective) {
+            var removeBtn = document.createElement('button');
+            removeBtn.className = 'remove-defect-btn';
+            removeBtn.title = '标记为正常（移出废片）';
+            removeBtn.textContent = '×';
+            removeBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                removeDefect(photo.path, card);
+            });
+            card.appendChild(removeBtn);
         }
 
         // 缩略图
@@ -1056,13 +1099,13 @@ layui.use(['element', 'form', 'layer'], function(){
         var filenameEl = document.createElement('div');
         filenameEl.className = 'card-filename';
         filenameEl.title = photo.path;
-        filenameEl.textContent = photo.filename; // textContent 防 XSS
+        filenameEl.textContent = photo.filename;
         info.appendChild(filenameEl);
 
         if (isDefective) {
             var descEl = document.createElement('div');
             descEl.className = 'card-desc';
-            descEl.textContent = photo.description; // textContent 防 XSS
+            descEl.textContent = photo.description;
             info.appendChild(descEl);
 
             var confEl = document.createElement('div');
@@ -1073,6 +1116,55 @@ layui.use(['element', 'form', 'layer'], function(){
 
         card.appendChild(info);
         return card;
+    }
+
+    // ==================== 移除废片标记（手动审核误判） ====================
+    function removeDefect(path, cardEl) {
+        layer.confirm('确认将此照片标记为正常照片？', {
+            title: '手动审核',
+            btn: ['确认', '取消'],
+            shadeClose: true
+        }, function(index) {
+            fetch('/api/remove-defect', {
+                method: 'POST',
+                headers: getHeaders({'Content-Type': 'application/json'}),
+                body: JSON.stringify({path: path})
+            })
+            .then(function(res) { return res.json(); })
+            .then(function(data) {
+                if (data.error) {
+                    showError(data.error);
+                    return;
+                }
+                cardEl.style.transition = 'all 0.3s ease';
+                cardEl.style.opacity = '0';
+                cardEl.style.transform = 'scale(0.8)';
+                setTimeout(function() {
+                    // 移除此卡片并刷新结果
+                    cardEl.remove();
+                    refreshResults();
+                }, 300);
+                showToast('已标记为正常', 1);
+            })
+            .catch(function() {
+                showError('操作失败，请重试');
+            })
+            .finally(function() {
+                layer.close(index);
+            });
+        });
+    }
+
+    // ==================== 刷新结果（不移除已选文件） ====================
+    function refreshResults() {
+        fetch('/api/status', { headers: getHeaders() })
+            .then(function(res){ return res.json(); })
+            .then(function(data){
+                if (data && data.completed) {
+                    displayResults(data);
+                }
+            })
+            .catch(function(){});
     }
 
     // ==================== 全选/取消全选 ====================

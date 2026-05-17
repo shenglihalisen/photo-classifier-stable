@@ -4,8 +4,11 @@
 检测手指遮挡和镜头遮挡
 """
 
+import os
 import cv2
 import numpy as np
+
+import mediapipe as mp
 
 from .base import BaseDetector, DetectionResult, DefectType
 
@@ -15,37 +18,41 @@ class ObstructionDetector(BaseDetector):
     遮挡检测器
 
     检测两种类型的遮挡:
-    1. 手指遮挡: 在人脸区域周围检测肤色像素异常集中区域
-    2. 镜头遮挡: 分析图像四角和边缘区域的颜色分布，大面积异常色块表示遮挡
+    1. 镜头遮挡: 分析图像四角和边缘区域，大面积均匀色块（与中心差异大）表示遮挡
+    2. 手指遮挡: 在人脸周围检测肤色像素异常集中区域
     """
 
-    # 检测阈值
-    CORNER_OBSTRUCTION_RATIO = 0.75   # 四角遮挡比例阈值（3/4 以上才触发）
-    CORNER_UNIFORMITY_THRESHOLD = 8   # 四角区域颜色均匀性阈值（标准差，降低以减少误判）
-    CORNER_CHECK_SIZE = 0.15          # 四角检查区域占图像尺寸的比例
+    CORNER_OBSTRUCTION_RATIO = 0.50   # 四角遮挡比例（>= 2/4 即触发）
+    EDGE_OBSTRUCTION_RATIO = 0.50     # 边缘遮挡比例（>= 2/4 即触发）
+    CORNER_UNIFORMITY_THRESHOLD = 12  # 四角区域颜色均匀性阈值（标准差）
+    CORNER_CHECK_SIZE = 0.15
 
-    # 肤色范围 (HSV)
-    SKIN_LOWER = np.array([0, 30, 60], dtype=np.uint8)
-    SKIN_UPPER = np.array([20, 170, 255], dtype=np.uint8)
+    SKIN_LOWER = np.array([0, 20, 50], dtype=np.uint8)
+    SKIN_UPPER = np.array([25, 180, 255], dtype=np.uint8)
 
     def __init__(self):
-        self._face_mesh_finger = None
+        self._face_landmarker = None
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.OBSTRUCTION
 
-    def _get_face_mesh_finger(self):
-        """延迟初始化 MediaPipe Face Mesh（手指遮挡检测用）"""
-        if self._face_mesh_finger is None:
-            import mediapipe as mp
-            self._face_mesh_finger = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=5,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
+    def _get_face_landmarker(self):
+        if self._face_landmarker is None:
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
+            model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+            with open(model_path, "rb") as f:
+                model_data = f.read()
+            self._face_landmarker = vision.FaceLandmarker.create_from_options(
+                vision.FaceLandmarkerOptions(
+                    base_options=python.BaseOptions(model_asset_buffer=model_data),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_faces=5,
+                    min_face_detection_confidence=0.5,
+                )
             )
-        return self._face_mesh_finger
+        return self._face_landmarker
 
     def detect(self, image_path: str) -> DetectionResult:
         """检测图片是否存在遮挡"""
@@ -111,196 +118,155 @@ class ObstructionDetector(BaseDetector):
             )
 
     def _detect_lens_obstruction(self, img: np.ndarray) -> dict:
-        """
-        检测镜头遮挡
-
-        分析图像四角和边缘区域，如果存在大面积均匀色块（如手指遮住镜头），
-        则判定为遮挡。
-
-        返回:
-            {"is_obstructed": bool, "confidence": float, "description": str}
-        """
         h, w = img.shape[:2]
-        corner_size_w = int(w * self.CORNER_CHECK_SIZE)
-        corner_size_h = int(h * self.CORNER_CHECK_SIZE)
 
-        # 提取四个角落区域
-        corners = [
-            img[:corner_size_h, :corner_size_w],                          # 左上
-            img[:corner_size_h, w - corner_size_w:],                      # 右上
-            img[h - corner_size_h:, :corner_size_w],                      # 左下
-            img[h - corner_size_h:, w - corner_size_w:],                  # 右下
-        ]
+        # Divide image into 5x5 grid, each cell = 1/25 of image
+        rows, cols = 5, 5
+        cell_h, cell_w = h // rows, w // cols
 
-        # 提取四条边缘区域
-        edge_thickness = max(3, int(min(h, w) * 0.03))
-        edges = [
-            img[:edge_thickness, :],          # 上边缘
-            img[h - edge_thickness:, :],      # 下边缘
-            img[:, :edge_thickness],          # 左边缘
-            img[:, w - edge_thickness:],      # 右边缘
-        ]
+        # Compute stats for each cell
+        cell_stats = []
+        for r in range(rows):
+            for c in range(cols):
+                y1, y2 = r * cell_h, (r + 1) * cell_h if r < rows - 1 else h
+                x1, x2 = c * cell_w, (c + 1) * cell_w if c < cols - 1 else w
+                cell = img[y1:y2, x1:x2]
+                mean_bright = float(np.mean(cell))
+                std_b = float(np.std(cell[:, :, 0]))
+                std_g = float(np.std(cell[:, :, 1]))
+                std_r = float(np.std(cell[:, :, 2]))
+                avg_std = (std_b + std_g + std_r) / 3.0
+                cell_stats.append({
+                    "row": r, "col": c,
+                    "brightness": mean_bright,
+                    "std": avg_std,
+                })
 
-        # 计算中心区域的平均颜色（用于与四角对比）
-        center_region = img[h//4:3*h//4, w//4:3*w//4]
-        center_mean_color = center_region.mean(axis=(0, 1))
+        # Center cells (rows 1-3, cols 1-3)
+        center_cells = [s for s in cell_stats if 1 <= s["row"] <= 3 and 1 <= s["col"] <= 3]
+        center_avg_bright = float(np.mean([c["brightness"] for c in center_cells])) if center_cells else 128
 
+        # Edge cells: top/bottom rows and left/right columns (excluding corners counted twice)
+        edge_cells = [s for s in cell_stats if s["row"] == 0 or s["row"] == 4 or s["col"] == 0 or s["col"] == 4]
+        corner_cells = [s for s in cell_stats if (s["row"] == 0 or s["row"] == 4) and (s["col"] == 0 or s["col"] == 4)]
+
+        reasons = []
+        scores = []
+
+        # Check 1: Edge cells much darker than center (lens obstruction / finger over lens)
+        dark_edge_count = 0
+        for s in edge_cells:
+            if s["brightness"] < center_avg_bright * 0.5 and s["std"] < 25:
+                dark_edge_count += 1
+        dark_edge_ratio = dark_edge_count / len(edge_cells) if edge_cells else 0
+        if dark_edge_ratio >= 0.4:
+            scores.append(min(1.0, dark_edge_ratio))
+            reasons.append(f"边缘偏暗{dark_edge_count}/{len(edge_cells)}")
+
+        # Check 2: Corner cells uniform and much different from center
         obstructed_corners = 0
-
-        # 检查四角区域
-        for i, corner in enumerate(corners):
-            # 计算该区域的颜色标准差
-            std_b = float(np.std(corner[:, :, 0]))
-            std_g = float(np.std(corner[:, :, 1]))
-            std_r = float(np.std(corner[:, :, 2]))
-            avg_std = (std_b + std_g + std_r) / 3.0
-
-            # 计算该区域的平均颜色
-            mean_color = corner.mean(axis=(0, 1))
-
-            # 计算四角与中心的颜色差异
-            color_diff = float(np.abs(mean_color - center_mean_color).mean())
-
-            # 遮挡判定：四角自身均匀 + 与中心颜色差异大
-            is_uniform = avg_std < self.CORNER_UNIFORMITY_THRESHOLD
-            is_different_from_center = color_diff > 25  # 与中心差异超过阈值
-
-            if is_uniform and is_different_from_center:
+        for s in corner_cells:
+            color_diff = abs(s["brightness"] - center_avg_bright)
+            if s["std"] < self.CORNER_UNIFORMITY_THRESHOLD and color_diff > 30:
                 obstructed_corners += 1
+        corner_ratio = obstructed_corners / len(corner_cells) if corner_cells else 0
+        if corner_ratio >= 0.25:
+            scores.append(min(1.0, corner_ratio + 0.2))
+            reasons.append(f"角落异常{obstructed_corners}/{len(corner_cells)}")
 
-        # 检查边缘区域
-        obstructed_edges = 0
-        for edge in edges:
-            std_b = float(np.std(edge[:, :, 0]))
-            std_g = float(np.std(edge[:, :, 1]))
-            std_r = float(np.std(edge[:, :, 2]))
-            avg_std = (std_b + std_g + std_r) / 3.0
+        # Check 3: Overall darkness uniformity (all cells similarly dark = lens cap)
+        all_brights = [s["brightness"] for s in cell_stats]
+        overall_std = float(np.std(all_brights))
+        overall_mean = float(np.mean(all_brights))
+        if overall_mean < 60 and overall_std < 20:
+            scores.append(0.8)
+            reasons.append("整体偏暗均匀")
 
-            edge_mean_color = edge.mean(axis=(0, 1))
-            color_diff = float(np.abs(edge_mean_color - center_mean_color).mean())
+        # Check 4: Edge cells very uniform (std < 8) and different from center
+        uniform_edge_count = 0
+        for s in edge_cells:
+            color_diff = abs(s["brightness"] - center_avg_bright)
+            if s["std"] < 8 and color_diff > 25:
+                uniform_edge_count += 1
+        uniform_edge_ratio = uniform_edge_count / len(edge_cells) if edge_cells else 0
+        if uniform_edge_ratio >= 0.3:
+            scores.append(min(1.0, uniform_edge_ratio + 0.1))
+            reasons.append(f"边缘均匀异常{uniform_edge_count}/{len(edge_cells)}")
 
-            is_uniform = avg_std < self.CORNER_UNIFORMITY_THRESHOLD
-            is_different_from_center = color_diff > 25
-
-            if is_uniform and is_different_from_center:
-                obstructed_edges += 1
-
-        # 判断逻辑：多个角落被遮挡 + 边缘也有遮挡
-        corner_ratio = obstructed_corners / 4.0
-        edge_ratio = obstructed_edges / 4.0
-
-        is_obstructed = corner_ratio >= self.CORNER_OBSTRUCTION_RATIO and edge_ratio >= 0.5
-
-        if is_obstructed:
-            confidence = min(1.0, corner_ratio + edge_ratio * 0.3)
+        if scores:
             return {
                 "is_obstructed": True,
-                "confidence": confidence,
-                "description": f"镜头遮挡: {obstructed_corners}/4个角落异常, "
-                              f"{obstructed_edges}/4条边缘异常"
+                "confidence": max(scores),
+                "description": f"镜头遮挡: {'; '.join(reasons)}"
             }
 
-        return {
-            "is_obstructed": False,
-            "confidence": 0.0,
-            "description": ""
-        }
+        return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
     def _detect_finger_obstruction(self, img: np.ndarray) -> dict:
-        """
-        检测手指遮挡
-
-        在图像中检测肤色像素，如果在人脸区域周围或图像边缘
-        存在大面积肤色像素集中区域，可能是指 finger 遮挡。
-
-        返回:
-            {"is_obstructed": bool, "confidence": float, "description": str}
-        """
         try:
             h, w = img.shape[:2]
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
 
-            face_mesh = self._get_face_mesh_finger()
-            results = face_mesh.process(rgb_img)
+            face_landmarker = self._get_face_landmarker()
+            detection_result = face_landmarker.detect(image)
 
-            # 无人脸时跳过手指遮挡检测
-            if not results.multi_face_landmarks:
-                return {
-                    "is_obstructed": False,
-                    "confidence": 0.0,
-                    "description": ""
-                }
+            if not detection_result.face_landmarks:
+                return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
-            # 转换为 HSV 检测肤色
             hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
             skin_mask = cv2.inRange(hsv, self.SKIN_LOWER, self.SKIN_UPPER)
 
-            # 对肤色掩码做形态学操作去噪
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
             skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-            total_skin_pixels = cv2.countNonZero(skin_mask)
             total_pixels = h * w
-            skin_ratio = total_skin_pixels / total_pixels
+            total_skin = cv2.countNonZero(skin_mask)
+            skin_ratio = total_skin / total_pixels
 
-            # 肤色占比过高（> 60%）可能存在手指遮挡
-            FINGER_SKIN_RATIO_THRESHOLD = 0.60
-
-            if skin_ratio > FINGER_SKIN_RATIO_THRESHOLD:
-                confidence = min(1.0, (skin_ratio - FINGER_SKIN_RATIO_THRESHOLD) / 0.2 + 0.5)
+            if skin_ratio > 0.55:
+                conf = min(1.0, (skin_ratio - 0.55) / 0.25 + 0.5)
                 return {
                     "is_obstructed": True,
-                    "confidence": confidence,
-                    "description": f"手指遮挡: 肤色占比={skin_ratio:.1%} (阈值={FINGER_SKIN_RATIO_THRESHOLD:.0%})"
+                    "confidence": conf,
+                    "description": f"手指遮挡: 肤色占比={skin_ratio:.1%}"
                 }
 
-            # 检查人脸区域上方的肤色集中区域（手指可能从上方遮挡）
-            for face_landmarks in results.multi_face_landmarks:
-                # 获取人脸边界框
-                face_x_coords = [lm.x * w for lm in face_landmarks.landmark]
-                face_y_coords = [lm.y * h for lm in face_landmarks.landmark]
-                face_x_min = int(min(face_x_coords))
-                face_x_max = int(max(face_x_coords))
-                face_y_min = int(min(face_y_coords))
-                face_y_max = int(max(face_y_coords))
+            for face_landmarks in detection_result.face_landmarks:
+                xs = [lm.x * w for lm in face_landmarks]
+                ys = [lm.y * h for lm in face_landmarks]
+                x_min, x_max = int(min(xs)), int(max(xs))
+                y_min, y_max = int(min(ys)), int(max(ys))
+                face_w, face_h = x_max - x_min, y_max - y_min
+                margin = 20
 
-                # 检查人脸上方区域
-                above_face_y_start = max(0, face_y_min - int((face_y_max - face_y_min) * 0.5))
-                above_face_y_end = face_y_min
-                above_face_x_start = max(0, face_x_min - 20)
-                above_face_x_end = min(w, face_x_max + 20)
+                regions = [
+                    ("上方", max(0, y_min - face_h // 2), y_min,
+                     max(0, x_min - margin), min(w, x_max + margin)),
+                    ("下方", y_max, min(h, y_max + face_h // 2),
+                     max(0, x_min - margin), min(w, x_max + margin)),
+                    ("左侧", max(0, y_min - margin), min(h, y_max + margin),
+                     max(0, x_min - face_w // 2), x_min),
+                    ("右侧", max(0, y_min - margin), min(h, y_max + margin),
+                     x_max, min(w, x_max + face_w // 2)),
+                ]
 
-                if above_face_y_end > above_face_y_start:
-                    above_region = skin_mask[above_face_y_start:above_face_y_end,
-                                             above_face_x_start:above_face_x_end]
-                    above_region_size = above_region.size
-                    if above_region_size > 0:
-                        above_skin_ratio = cv2.countNonZero(above_region) / above_region_size
-                        if above_skin_ratio > 0.7:
-                            confidence = min(1.0, above_skin_ratio)
+                for name, y1, y2, x1, x2 in regions:
+                    if y2 > y1 and x2 > x1:
+                        region = skin_mask[y1:y2, x1:x2]
+                        region_ratio = cv2.countNonZero(region) / region.size
+                        if region_ratio > 0.6:
+                            conf = min(1.0, region_ratio)
                             return {
                                 "is_obstructed": True,
-                                "confidence": confidence,
-                                "description": f"手指遮挡: 人脸上方肤色集中(占比={above_skin_ratio:.1%})"
+                                "confidence": conf,
+                                "description": f"手指遮挡: 人脸{name}肤色集中(占比={region_ratio:.1%})"
                             }
 
-            return {
-                "is_obstructed": False,
-                "confidence": 0.0,
-                "description": ""
-            }
+            return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
         except ImportError:
-            # MediaPipe 不可用时跳过手指遮挡检测
-            return {
-                "is_obstructed": False,
-                "confidence": 0.0,
-                "description": ""
-            }
+            return {"is_obstructed": False, "confidence": 0.0, "description": ""}
         except Exception:
-            return {
-                "is_obstructed": False,
-                "confidence": 0.0,
-                "description": ""
-            }
+            return {"is_obstructed": False, "confidence": 0.0, "description": ""}

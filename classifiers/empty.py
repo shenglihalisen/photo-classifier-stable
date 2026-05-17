@@ -26,7 +26,7 @@ class EmptyDetector(BaseDetector):
     WHITE_THRESHOLD = 240         # 纯白灰度阈值
     LAPLACIAN_VAR_THRESHOLD = 10  # 拉普拉斯方差阈值（无纹理）
     COLOR_STD_THRESHOLD = 8       # 颜色标准差阈值（无色彩变化）
-    OVERALL_SCORE_THRESHOLD = 0.6 # 综合评分阈值
+    OVERALL_SCORE_THRESHOLD = 0.4 # 综合评分阈值
 
     @property
     def defect_type(self) -> DefectType:
