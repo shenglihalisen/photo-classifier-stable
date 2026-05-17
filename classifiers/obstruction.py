@@ -28,9 +28,24 @@ class ObstructionDetector(BaseDetector):
     SKIN_LOWER = np.array([0, 30, 60], dtype=np.uint8)
     SKIN_UPPER = np.array([20, 170, 255], dtype=np.uint8)
 
+    def __init__(self):
+        self._face_mesh_finger = None
+
     @property
     def defect_type(self) -> DefectType:
         return DefectType.OBSTRUCTION
+
+    def _get_face_mesh_finger(self):
+        """延迟初始化 MediaPipe Face Mesh（手指遮挡检测用）"""
+        if self._face_mesh_finger is None:
+            import mediapipe as mp
+            self._face_mesh_finger = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                max_num_faces=5,
+                refine_landmarks=True,
+                min_detection_confidence=0.5,
+            )
+        return self._face_mesh_finger
 
     def detect(self, image_path: str) -> DetectionResult:
         """检测图片是否存在遮挡"""
@@ -202,17 +217,10 @@ class ObstructionDetector(BaseDetector):
             {"is_obstructed": bool, "confidence": float, "description": str}
         """
         try:
-            import mediapipe as mp
-
             h, w = img.shape[:2]
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-            face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                max_num_faces=5,
-                refine_landmarks=True,
-                min_detection_confidence=0.5,
-            )
+            face_mesh = self._get_face_mesh_finger()
             results = face_mesh.process(rgb_img)
 
             # 无人脸时跳过手指遮挡检测

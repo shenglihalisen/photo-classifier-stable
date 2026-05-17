@@ -71,7 +71,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024        # 单文件 50MB
 MAX_TOTAL_SIZE = 200 * 1024 * 1024      # 总上传 200MB
 
 # 允许的图片扩展名
-ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif'}
+ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.heic', '.heif'}
 
 # 文件头魔数映射（扩展名 -> 魔数字节）
 FILE_MAGIC_NUMBERS = {
@@ -185,12 +185,12 @@ def is_path_safe(path: str) -> bool:
     if not path:
         return False
 
+    # 检查原始路径中是否包含路径遍历（在 normpath 之前检查）
+    if ".." in path.replace("/", os.sep).split(os.sep):
+        return False
+
     # 规范化路径
     normalized = os.path.normpath(path)
-
-    # 检查路径遍历攻击：禁止 .. 逃逸
-    if '..' in normalized.split(os.sep):
-        return False
 
     # 检查绝对路径是否指向受保护目录
     abs_path = os.path.abspath(normalized)
@@ -219,7 +219,7 @@ def sanitize_error_message(error: Exception) -> str:
     msg = str(error)
     # 移除绝对路径信息
     msg = re.sub(r'[A-Za-z]:\\[^\s:]+', '[路径已隐藏]', msg)
-    msg = re.sub(r'/[^\s:]+/\.\.\.', '[路径已隐藏]', msg)
+    msg = re.sub(r'/[^\s]+', '[路径已隐藏]', msg)
     # 移除可能的用户名
     msg = re.sub(r'Users\\[^\\]+\\', 'Users\\[用户]\\', msg)
     msg = re.sub(r'/home/[^/]+/', '/home/[用户]/', msg)
