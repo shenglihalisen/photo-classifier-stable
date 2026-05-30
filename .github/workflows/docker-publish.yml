@@ -21,6 +21,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -43,7 +46,7 @@ jobs:
             type=sha
             type=raw,value=latest
 
-      - name: Build and push Docker image
+      - name: Build and push Docker image (multi-arch)
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -52,5 +55,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # 暂时只构建 amd64 架构（arm64 需要更多依赖处理）
-          platforms: linux/amd64
+          # 支持 x86_64 和 ARM64（包括 Apple Silicon 和 ARM 服务器）
+          platforms: linux/amd64,linux/arm64

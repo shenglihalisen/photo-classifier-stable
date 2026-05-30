@@ -2,13 +2,37 @@
 """
 闭眼检测器
 使用 MediaPipe Face Mesh 检测人脸，通过 Eye Aspect Ratio (EAR) 判断是否闭眼
+
+支持平台：
+- x86_64 (Linux/Windows/Mac)
+- ARM64 (Linux/Mac Apple Silicon)
+
+MediaPipe >= 0.10.9 已原生支持 ARM64
 """
 
 import os
+import sys
+import platform
+import logging
 import cv2
 import numpy as np
 
-import mediapipe as mp
+# 设置日志
+logger = logging.getLogger("photo_classifier.blink")
+
+# MediaPipe 导入（带错误处理）
+_mediapipe_available = False
+_mp_image_class = None
+
+try:
+    import mediapipe as mp
+    _mediapipe_available = True
+    _mp_image_class = mp.Image
+    logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
+except ImportError as e:
+    logger.warning(f"MediaPipe 未安装，闭眼检测将被禁用: {e}")
+except OSError as e:
+    logger.warning(f"MediaPipe 加载失败（可能是缺少系统库），闭眼检测将被禁用: {e}")
 
 from .base import BaseDetector, DetectionResult, DefectType
 
@@ -21,43 +45,95 @@ class BlinkDetector(BaseDetector):
     计算 Eye Aspect Ratio (EAR) 来判断是否闭眼。
     如果检测到多个人脸，任一人闭眼即标记为缺陷。
     无人脸时返回非缺陷（不判定为废片）。
+
+    注意：如果 MediaPipe 未安装或加载失败，此检测器将返回"未检测"结果。
     """
 
     # EAR 阈值
     EAR_THRESHOLD = 0.2
 
     # MediaPipe Face Mesh 眼部关键点索引
-    # 左眼（从观察者角度的右眼）
     LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-    # 右眼（从观察者角度的左眼）
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
     def __init__(self):
         self._face_landmarker = None
+        self._init_error = None
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.BLINK
 
+    @property
+    def is_available(self) -> bool:
+        """检查检测器是否可用（MediaPipe 是否正常加载）"""
+        return _mediapipe_available
+
     def _get_face_landmarker(self):
+        """获取 FaceLandmarker 实例（延迟初始化）"""
+        if self._init_error:
+            # 之前初始化失败，不再尝试
+            return None
+
         if self._face_landmarker is None:
-            from mediapipe.tasks import python
-            from mediapipe.tasks.python import vision
-            model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
-            with open(model_path, "rb") as f:
-                model_data = f.read()
-            self._face_landmarker = vision.FaceLandmarker.create_from_options(
-                vision.FaceLandmarkerOptions(
-                    base_options=python.BaseOptions(model_asset_buffer=model_data),
-                    running_mode=vision.RunningMode.IMAGE,
-                    num_faces=5,
-                    min_face_detection_confidence=0.5,
+            if not _mediapipe_available:
+                self._init_error = "MediaPipe 未安装或加载失败"
+                logger.warning(self._init_error)
+                return None
+
+            try:
+                from mediapipe.tasks import python
+                from mediapipe.tasks.python import vision
+
+                model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+
+                if not os.path.exists(model_path):
+                    self._init_error = f"模型文件不存在: {model_path}"
+                    logger.error(self._init_error)
+                    return None
+
+                with open(model_path, "rb") as f:
+                    model_data = f.read()
+
+                self._face_landmarker = vision.FaceLandmarker.create_from_options(
+                    vision.FaceLandmarkerOptions(
+                        base_options=python.BaseOptions(model_asset_buffer=model_data),
+                        running_mode=vision.RunningMode.IMAGE,
+                        num_faces=5,
+                        min_face_detection_confidence=0.5,
+                    )
                 )
-            )
+                logger.info("FaceLandmarker 初始化成功")
+
+            except Exception as e:
+                self._init_error = f"FaceLandmarker 初始化失败: {e}"
+                logger.error(self._init_error)
+                return None
+
         return self._face_landmarker
 
     def detect(self, image_path: str) -> DetectionResult:
         """检测图片中是否有人闭眼"""
+        # 检查 MediaPipe 是否可用
+        if not _mediapipe_available:
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.0,
+                description="闭眼检测不可用：MediaPipe 未安装或加载失败。"
+                           f"请安装 mediapipe>=0.10.9 (当前平台: {platform.machine()})"
+            )
+
+        # 检查 FaceLandmarker 是否初始化成功
+        face_landmarker = self._get_face_landmarker()
+        if face_landmarker is None:
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.0,
+                description=f"闭眼检测不可用：{self._init_error or 'FaceLandmarker 未初始化'}"
+            )
+
         try:
             img = self.read_image(image_path)
             if img is None:
@@ -70,7 +146,6 @@ class BlinkDetector(BaseDetector):
 
             rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
-            face_landmarker = self._get_face_landmarker()
             detection_result = face_landmarker.detect(image)
 
             if not detection_result.face_landmarks:
@@ -91,7 +166,6 @@ class BlinkDetector(BaseDetector):
                 left_eye_pts = self._get_eye_points(face_landmarks, self.LEFT_EYE_INDICES, w, h)
                 right_eye_pts = self._get_eye_points(face_landmarks, self.RIGHT_EYE_INDICES, w, h)
 
-                # 计算 EAR
                 left_ear = self._calculate_ear(left_eye_pts)
                 right_ear = self._calculate_ear(right_eye_pts)
                 avg_ear = (left_ear + right_ear) / 2.0
@@ -119,6 +193,7 @@ class BlinkDetector(BaseDetector):
                 )
 
         except Exception as e:
+            logger.error(f"闭眼检测异常: {e}")
             return DetectionResult(
                 is_defective=False,
                 defect_type=None,
@@ -136,29 +211,11 @@ class BlinkDetector(BaseDetector):
         return np.array(points, dtype=np.float64)
 
     def _calculate_ear(self, eye_points: np.ndarray) -> float:
-        """
-        计算 Eye Aspect Ratio (EAR)
+        """计算 Eye Aspect Ratio (EAR)"""
+        dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])
+        dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])
+        dist_3 = np.linalg.norm(eye_points[0] - eye_points[3])
 
-        EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-
-        其中 p1-p6 为眼部6个关键点:
-            p1, p4: 眼角水平方向
-            p2, p3, p5, p6: 眼睛上下边缘
-
-        参数:
-            eye_points: shape=(6, 2) 的眼部关键点坐标
-
-        返回:
-            EAR 值，越小表示眼睛越闭合
-        """
-        # 计算垂直距离（眼睛上下边缘）
-        dist_1 = np.linalg.norm(eye_points[1] - eye_points[5])  # p2-p6
-        dist_2 = np.linalg.norm(eye_points[2] - eye_points[4])  # p3-p5
-
-        # 计算水平距离（眼角）
-        dist_3 = np.linalg.norm(eye_points[0] - eye_points[3])  # p1-p4
-
-        # 避免除以零
         if dist_3 == 0:
             return 0.0
 
