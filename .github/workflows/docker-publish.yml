@@ -52,4 +52,5 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          # 暂时只构建 amd64 架构（arm64 需要更多依赖处理）
+          platforms: linux/amd64

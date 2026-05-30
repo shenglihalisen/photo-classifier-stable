@@ -15,24 +15,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FLASK_APP=run_web.py \
     FLASK_ENV=production \
     TZ=Asia/Shanghai \
-    # 临时文件目录（上传文件存储位置）
-    TMPDIR=/tmp \
-    # 上传文件最大大小：单文件50MB，总计200MB
-    MAX_FILE_SIZE=52428800 \
-    MAX_TOTAL_SIZE=209715200
+    TMPDIR=/tmp
 
 # 安装系统依赖
-# OpenCV 和 MediaPipe 需要以下库
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx \
-    libgles2-mesa \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
-    ffmpeg \
-    curl \
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libgl1-mesa-glx \
+        libgles2-mesa \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        ffmpeg \
+        curl \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
@@ -41,7 +37,6 @@ WORKDIR /app
 
 # 复制依赖文件并安装
 COPY requirements.txt .
-# 移除PyQt5（桌面端依赖，Web端不需要）
 RUN sed -i '/PyQt5/d' requirements.txt && \
     pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
@@ -52,15 +47,12 @@ COPY engine/ ./engine/
 COPY web/ ./web/
 COPY run_web.py .
 
-# 创建上传/临时目录并设置权限
-# Flask上传文件通过tempfile.mkdtemp存储在/tmp下
-RUN mkdir -p /tmp /app/uploads && \
-    chmod 777 /tmp /app/uploads
+# 创建临时目录并设置权限
+RUN mkdir -p /tmp && chmod 1777 /tmp
 
 # 创建非root用户运行应用
 RUN useradd -m -u 1000 appuser && \
-    chown -R appuser:appuser /app && \
-    chown -R appuser:appuser /tmp
+    chown -R appuser:appuser /app
 USER appuser
 
 # 暴露端口
@@ -68,7 +60,7 @@ EXPOSE 5000
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:5000/api/health || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')" || exit 1
 
 # 启动命令
 CMD ["python", "run_web.py"]
