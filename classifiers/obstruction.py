@@ -3,11 +3,7 @@
 遮挡检测器
 检测手指遮挡和镜头遮挡
 
-支持平台：
-- x86_64 (Linux/Windows/Mac)
-- ARM64 (Linux/Mac Apple Silicon)
-
-MediaPipe >= 0.10.9 已原生支持 ARM64
+强制使用 MediaPipe，加载失败时抛出错误
 """
 
 import os
@@ -19,17 +15,9 @@ import numpy as np
 # 设置日志
 logger = logging.getLogger("photo_classifier.obstruction")
 
-# MediaPipe 导入（带错误处理）
-_mediapipe_available = False
-
-try:
-    import mediapipe as mp
-    _mediapipe_available = True
-    logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
-except ImportError as e:
-    logger.warning(f"MediaPipe 未安装，手指遮挡检测将被禁用: {e}")
-except OSError as e:
-    logger.warning(f"MediaPipe 加载失败（可能是缺少系统库），手指遮挡检测将被禁用: {e}")
+# 强制导入 MediaPipe，失败时抛出错误
+import mediapipe as mp
+logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
 
 from .base import BaseDetector, DetectionResult, DefectType
 
@@ -40,9 +28,7 @@ class ObstructionDetector(BaseDetector):
 
     检测两种类型的遮挡:
     1. 镜头遮挡: 分析图像四角和边缘区域，大面积均匀色块（与中心差异大）表示遮挡
-    2. 手指遮挡: 在人脸周围检测肤色像素异常集中区域（需要 MediaPipe）
-
-    注意：手指遮挡检测需要 MediaPipe，如果未安装则仅执行镜头遮挡检测。
+    2. 手指遮挡: 在人脸周围检测肤色像素异常集中区域
     """
 
     CORNER_OBSTRUCTION_RATIO = 0.50
@@ -55,133 +41,93 @@ class ObstructionDetector(BaseDetector):
 
     def __init__(self):
         self._face_landmarker = None
-        self._init_error = None
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.OBSTRUCTION
 
-    @property
-    def is_available(self) -> bool:
-        """检查检测器是否可用"""
-        return True  # 镜头遮挡检测始终可用，手指遮挡检测依赖 MediaPipe
-
-    @property
-    def finger_detection_available(self) -> bool:
-        """检查手指遮挡检测是否可用（需要 MediaPipe）"""
-        return _mediapipe_available
-
     def _get_face_landmarker(self):
         """获取 FaceLandmarker 实例（延迟初始化）"""
-        if self._init_error:
-            return None
-
         if self._face_landmarker is None:
-            if not _mediapipe_available:
-                self._init_error = "MediaPipe 未安装或加载失败"
-                return None
+            from mediapipe.tasks import python
+            from mediapipe.tasks.python import vision
 
-            try:
-                from mediapipe.tasks import python
-                from mediapipe.tasks.python import vision
+            model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
 
-                model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"模型文件不存在: {model_path}")
 
-                if not os.path.exists(model_path):
-                    self._init_error = f"模型文件不存在: {model_path}"
-                    logger.error(self._init_error)
-                    return None
+            with open(model_path, "rb") as f:
+                model_data = f.read()
 
-                with open(model_path, "rb") as f:
-                    model_data = f.read()
-
-                self._face_landmarker = vision.FaceLandmarker.create_from_options(
-                    vision.FaceLandmarkerOptions(
-                        base_options=python.BaseOptions(model_asset_buffer=model_data),
-                        running_mode=vision.RunningMode.IMAGE,
-                        num_faces=5,
-                        min_face_detection_confidence=0.5,
-                    )
+            self._face_landmarker = vision.FaceLandmarker.create_from_options(
+                vision.FaceLandmarkerOptions(
+                    base_options=python.BaseOptions(model_asset_buffer=model_data),
+                    running_mode=vision.RunningMode.IMAGE,
+                    num_faces=5,
+                    min_face_detection_confidence=0.5,
                 )
-                logger.info("FaceLandmarker 初始化成功（遮挡检测器）")
-
-            except Exception as e:
-                self._init_error = f"FaceLandmarker 初始化失败: {e}"
-                logger.error(self._init_error)
-                return None
+            )
+            logger.info("FaceLandmarker 初始化成功（遮挡检测器）")
 
         return self._face_landmarker
 
     def detect(self, image_path: str) -> DetectionResult:
         """检测图片是否存在遮挡"""
-        try:
-            img = self.read_image(image_path)
-            if img is None:
-                return DetectionResult(
-                    is_defective=False,
-                    defect_type=None,
-                    confidence=0.0,
-                    description="无法读取图像，跳过遮挡检测"
-                )
-
-            reasons = []
-            scores = []
-
-            # 预检查：跳过纯黑/纯白图像
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            mean_brightness = float(np.mean(gray))
-            if mean_brightness < 15 or mean_brightness > 240:
-                return DetectionResult(
-                    is_defective=False,
-                    defect_type=None,
-                    confidence=0.0,
-                    description=f"图像亮度异常(均值={mean_brightness:.1f})，跳过遮挡检测"
-                )
-
-            # 1. 镜头遮挡检测（始终执行，不依赖 MediaPipe）
-            lens_result = self._detect_lens_obstruction(img)
-            if lens_result["is_obstructed"]:
-                scores.append(lens_result["confidence"])
-                reasons.append(lens_result["description"])
-
-            # 2. 手指遮挡检测（需要 MediaPipe 和人脸）
-            if _mediapipe_available:
-                finger_result = self._detect_finger_obstruction(img)
-                if finger_result["is_obstructed"]:
-                    scores.append(finger_result["confidence"])
-                    reasons.append(finger_result["description"])
-            else:
-                # MediaPipe 不可用时，记录但不影响检测结果
-                logger.debug("手指遮挡检测跳过：MediaPipe 不可用")
-
-            # 综合判断
-            if scores:
-                max_confidence = max(scores)
-                return DetectionResult(
-                    is_defective=True,
-                    defect_type=self.defect_type,
-                    confidence=max_confidence,
-                    description=f"遮挡检测: {'; '.join(reasons)}"
-                )
-            else:
-                return DetectionResult(
-                    is_defective=False,
-                    defect_type=None,
-                    confidence=0.8,
-                    description="未检测到遮挡"
-                )
-
-        except Exception as e:
-            logger.error(f"遮挡检测异常: {e}")
+        img = self.read_image(image_path)
+        if img is None:
             return DetectionResult(
                 is_defective=False,
                 defect_type=None,
                 confidence=0.0,
-                description=f"遮挡检测异常: {str(e)}"
+                description="无法读取图像，跳过遮挡检测"
+            )
+
+        reasons = []
+        scores = []
+
+        # 预检查：跳过纯黑/纯白图像
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        mean_brightness = float(np.mean(gray))
+        if mean_brightness < 15 or mean_brightness > 240:
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.0,
+                description=f"图像亮度异常(均值={mean_brightness:.1f})，跳过遮挡检测"
+            )
+
+        # 1. 镜头遮挡检测
+        lens_result = self._detect_lens_obstruction(img)
+        if lens_result["is_obstructed"]:
+            scores.append(lens_result["confidence"])
+            reasons.append(lens_result["description"])
+
+        # 2. 手指遮挡检测
+        finger_result = self._detect_finger_obstruction(img)
+        if finger_result["is_obstructed"]:
+            scores.append(finger_result["confidence"])
+            reasons.append(finger_result["description"])
+
+        # 综合判断
+        if scores:
+            max_confidence = max(scores)
+            return DetectionResult(
+                is_defective=True,
+                defect_type=self.defect_type,
+                confidence=max_confidence,
+                description=f"遮挡检测: {'; '.join(reasons)}"
+            )
+        else:
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.8,
+                description="未检测到遮挡"
             )
 
     def _detect_lens_obstruction(self, img: np.ndarray) -> dict:
-        """镜头遮挡检测（不依赖 MediaPipe）"""
+        """镜头遮挡检测"""
         h, w = img.shape[:2]
 
         rows, cols = 5, 5
@@ -263,76 +209,65 @@ class ObstructionDetector(BaseDetector):
         return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
     def _detect_finger_obstruction(self, img: np.ndarray) -> dict:
-        """手指遮挡检测（需要 MediaPipe）"""
-        if not _mediapipe_available:
-            return {"is_obstructed": False, "confidence": 0.0, "description": ""}
+        """手指遮挡检测"""
+        h, w = img.shape[:2]
+        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
 
         face_landmarker = self._get_face_landmarker()
-        if face_landmarker is None:
+        detection_result = face_landmarker.detect(image)
+
+        if not detection_result.face_landmarks:
             return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
-        try:
-            h, w = img.shape[:2]
-            rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_img)
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        skin_mask = cv2.inRange(hsv, self.SKIN_LOWER, self.SKIN_UPPER)
 
-            detection_result = face_landmarker.detect(image)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-            if not detection_result.face_landmarks:
-                return {"is_obstructed": False, "confidence": 0.0, "description": ""}
+        total_pixels = h * w
+        total_skin = cv2.countNonZero(skin_mask)
+        skin_ratio = total_skin / total_pixels
 
-            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-            skin_mask = cv2.inRange(hsv, self.SKIN_LOWER, self.SKIN_UPPER)
+        if skin_ratio > 0.55:
+            conf = min(1.0, (skin_ratio - 0.55) / 0.25 + 0.5)
+            return {
+                "is_obstructed": True,
+                "confidence": conf,
+                "description": f"手指遮挡: 肤色占比={skin_ratio:.1%}"
+            }
 
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-            skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        for face_landmarks in detection_result.face_landmarks:
+            xs = [lm.x * w for lm in face_landmarks]
+            ys = [lm.y * h for lm in face_landmarks]
+            x_min, x_max = int(min(xs)), int(max(xs))
+            y_min, y_max = int(min(ys)), int(max(ys))
+            face_w, face_h = x_max - x_min, y_max - y_min
+            margin = 20
 
-            total_pixels = h * w
-            total_skin = cv2.countNonZero(skin_mask)
-            skin_ratio = total_skin / total_pixels
+            regions = [
+                ("上方", max(0, y_min - face_h // 2), y_min,
+                 max(0, x_min - margin), min(w, x_max + margin)),
+                ("下方", y_max, min(h, y_max + face_h // 2),
+                 max(0, x_min - margin), min(w, x_max + margin)),
+                ("左侧", max(0, y_min - margin), min(h, y_max + margin),
+                 max(0, x_min - face_w // 2), x_min),
+                ("右侧", max(0, y_min - margin), min(h, y_max + margin),
+                 x_max, min(w, x_max + face_w // 2)),
+            ]
 
-            if skin_ratio > 0.55:
-                conf = min(1.0, (skin_ratio - 0.55) / 0.25 + 0.5)
-                return {
-                    "is_obstructed": True,
-                    "confidence": conf,
-                    "description": f"手指遮挡: 肤色占比={skin_ratio:.1%}"
-                }
+            for name, y1, y2, x1, x2 in regions:
+                if y2 > y1 and x2 > x1:
+                    region = skin_mask[y1:y2, x1:x2]
+                    region_ratio = cv2.countNonZero(region) / region.size
+                    if region_ratio > 0.6:
+                        conf = min(1.0, region_ratio)
+                        return {
+                            "is_obstructed": True,
+                            "confidence": conf,
+                            "description": f"手指遮挡: 人脸{name}肤色集中(占比={region_ratio:.1%})"
+                        }
 
-            for face_landmarks in detection_result.face_landmarks:
-                xs = [lm.x * w for lm in face_landmarks]
-                ys = [lm.y * h for lm in face_landmarks]
-                x_min, x_max = int(min(xs)), int(max(xs))
-                y_min, y_max = int(min(ys)), int(max(ys))
-                face_w, face_h = x_max - x_min, y_max - y_min
-                margin = 20
-
-                regions = [
-                    ("上方", max(0, y_min - face_h // 2), y_min,
-                     max(0, x_min - margin), min(w, x_max + margin)),
-                    ("下方", y_max, min(h, y_max + face_h // 2),
-                     max(0, x_min - margin), min(w, x_max + margin)),
-                    ("左侧", max(0, y_min - margin), min(h, y_max + margin),
-                     max(0, x_min - face_w // 2), x_min),
-                    ("右侧", max(0, y_min - margin), min(h, y_max + margin),
-                     x_max, min(w, x_max + face_w // 2)),
-                ]
-
-                for name, y1, y2, x1, x2 in regions:
-                    if y2 > y1 and x2 > x1:
-                        region = skin_mask[y1:y2, x1:x2]
-                        region_ratio = cv2.countNonZero(region) / region.size
-                        if region_ratio > 0.6:
-                            conf = min(1.0, region_ratio)
-                            return {
-                                "is_obstructed": True,
-                                "confidence": conf,
-                                "description": f"手指遮挡: 人脸{name}肤色集中(占比={region_ratio:.1%})"
-                            }
-
-            return {"is_obstructed": False, "confidence": 0.0, "description": ""}
-
-        except Exception as e:
-            logger.error(f"手指遮挡检测异常: {e}")
-            return {"is_obstructed": False, "confidence": 0.0, "description": ""}
+        return {"is_obstructed": False, "confidence": 0.0, "description": ""}

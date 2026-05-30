@@ -6,7 +6,7 @@ FROM python:3.11-slim-bookworm
 
 LABEL maintainer="shenglihalisen"
 LABEL description="智能检测损坏、空镜、闭眼、模糊、遮挡等缺陷照片的Web应用"
-LABEL version="1.2.0"
+LABEL version="1.2.1"
 LABEL org.opencontainers.image.source="https://github.com/shenglihalisen/photo-classifier-stable"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FLASK_ENV=production \
     TZ=Asia/Shanghai
 
-# 安装系统依赖（兼容 x86_64 和 ARM64）
+# 安装系统依赖（强制 MediaPipe 运行所需）
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1 \
