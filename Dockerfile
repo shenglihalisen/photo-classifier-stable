@@ -1,7 +1,7 @@
 # Photo Classifier - Docker Image
 # 镜像地址：ghcr.io/shenglihalisen/photo-classifier-stable
 
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 LABEL maintainer="shenglihalisen"
 LABEL description="智能检测损坏、空镜、闭眼、模糊、遮挡等缺陷照片的Web应用"
@@ -14,12 +14,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     FLASK_ENV=production \
     TZ=Asia/Shanghai
 
-# 安装系统依赖（分步执行以便定位问题）
-RUN apt-get update
-RUN apt-get install -y --no-install-recommends libgl1-mesa-glx libglib2.0-0
-RUN apt-get install -y --no-install-recommends libsm6 libxext6 libxrender1
-RUN apt-get install -y --no-install-recommends libgomp1 ffmpeg curl
-RUN rm -rf /var/lib/apt/lists/*
+# 安装系统依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        libxrender1 \
+        libgomp1 \
+        ffmpeg \
+        curl && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
