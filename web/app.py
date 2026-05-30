@@ -83,6 +83,8 @@ FILE_MAGIC_NUMBERS = {
     '.webp': (b'RIFF',),       # WebP 以 RIFF 开头，后跟 4 字节长度 + WEBP
     '.tiff': (b'II\x2a\x00', b'MM\x00\x2a'),  # Little/Big endian TIFF
     '.tif':  (b'II\x2a\x00', b'MM\x00\x2a'),
+    '.heic': (b'ftypheic',),
+    '.heif': (b'ftypmif1', b'ftypisom'),
 }
 
 # 需要保护的系统敏感路径（禁止访问）
@@ -186,7 +188,8 @@ def is_path_safe(path: str) -> bool:
         return False
 
     # 检查原始路径中是否包含路径遍历（在 normpath 之前检查）
-    if ".." in path.replace("/", os.sep).split(os.sep):
+    normalized_sep = path.replace("/", os.sep)
+    if ".." in [p for p in normalized_sep.split(os.sep) if p]:
         return False
 
     # 规范化路径
@@ -217,9 +220,10 @@ def sanitize_error_message(error: Exception) -> str:
         脱敏后的错误信息
     """
     msg = str(error)
-    # 移除绝对路径信息
+    # 移除绝对路径信息（Windows 盘符路径）
     msg = re.sub(r'[A-Za-z]:\\[^\s:]+', '[路径已隐藏]', msg)
-    msg = re.sub(r'/[^\s]+', '[路径已隐藏]', msg)
+    # 移除 Unix 绝对路径（以 / 开头且包含目录分隔符的路径）
+    msg = re.sub(r'/[^\s:/]+(?:/[^\s:]+)*', '[路径已隐藏]', msg)
     # 移除可能的用户名
     msg = re.sub(r'Users\\[^\\]+(?=\\)', '[用户]', msg)
     msg = re.sub(r'/home/[^/]+(?=/)', '/[用户]', msg)
@@ -454,10 +458,10 @@ class TempFileCleaner:
                 if not os.path.isdir(full_path):
                     continue
 
-                # 检查目录创建时间
+                # 检查目录修改时间（跨平台兼容：使用 st_mtime）
                 try:
                     stat = os.stat(full_path)
-                    age = now - stat.st_ctime
+                    age = now - stat.st_mtime
                     if age > self.max_age:
                         shutil.rmtree(full_path, ignore_errors=True)
                         cleaned_count += 1
@@ -1094,6 +1098,10 @@ def create_app(_test_scan_state=None) -> Flask:
                     # 再次进行路径安全检查
                     if not is_path_safe(path):
                         logger.warning("删除操作跳过不安全路径: %s", path)
+                        continue
+                    # 防御符号链接攻击
+                    if os.path.islink(path):
+                        logger.warning("删除操作跳过符号链接: %s", path)
                         continue
                     os.remove(path)
                     deleted.append(path)

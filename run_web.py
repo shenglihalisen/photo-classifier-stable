@@ -29,7 +29,8 @@ def main():
     print("  按 Ctrl+C 停止服务")
     print("=" * 50)
 
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
+    app.run(host="0.0.0.0", port=5000, debug=debug)
 
 
 if __name__ == "__main__":

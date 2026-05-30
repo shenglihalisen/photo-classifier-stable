@@ -115,7 +115,9 @@ def is_path_safe(path: str) -> bool:
         return False
 
     # 检查原始路径中是否包含路径遍历（在normpath之前检查）
-    if ".." in path.replace("/", os.sep).split(os.sep):
+    # 检查路径遍历：精确匹配 '..' 分量
+    normalized_sep = path.replace("/", os.sep)
+    if ".." in [p for p in normalized_sep.split(os.sep) if p]:
         return False
 
     normalized = os.path.normpath(path)
@@ -815,6 +817,7 @@ class DesktopApp(QMainWindow):
             return
 
         self.current_folder = folder
+        self.selected_files = []  # 清空手动选择的文件，避免文件夹和文件选择混用
         self.folder_label.setText(folder)
         self.scan_action.setEnabled(True)
         self.status_bar.showMessage(f"已选择文件夹: {folder}")
@@ -1278,11 +1281,19 @@ class DesktopApp(QMainWindow):
         )
 
         if reply == QMessageBox.Yes:
-            # 将所有检测结果标记为非缺陷
-            for result in self.scan_results[path]:
-                result.is_defective = False
+            # 用新的非缺陷结果替换原结果，避免修改不可变数据类
+            from classifiers.base import DetectionResult
+            self.scan_results[path] = [
+                DetectionResult(
+                    is_defective=False,
+                    defect_type=None,
+                    confidence=r.confidence,
+                    description=r.description,
+                )
+                for r in self.scan_results[path]
+            ]
 
-            # 从废片列表移到此项目
+            # 从废片列表移到正常列表
             self._move_item_between_lists(path, from_defective=True)
             self.status_bar.showMessage(f"已移出废片: {os.path.basename(path)}", 3000)
 
