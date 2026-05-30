@@ -30,14 +30,17 @@ import uuid
 import hmac
 import hashlib
 import logging
+import logging.handlers
 import threading
 import base64
 import tempfile
 import shutil
 import re
+import warnings
+import errno
 from io import BytesIO
 from functools import wraps
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 from flask import Flask, render_template, request, jsonify, g
 
@@ -46,12 +49,32 @@ from flask import Flask, render_template, request, jsonify, g
 # ============================================================
 logger = logging.getLogger("photo_classifier")
 logger.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter(
+_log_formatter = logging.Formatter(
     "[%(asctime)s] %(levelname)s %(name)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
-))
-logger.addHandler(_handler)
+)
+
+# 控制台输出
+_console_handler = logging.StreamHandler(sys.stdout)
+_console_handler.setFormatter(_log_formatter)
+logger.addHandler(_console_handler)
+
+# 文件输出（带日志轮转：每个文件 5MB，保留 3 个备份）
+_log_file_path = os.environ.get(
+    "PHOTO_CLASSIFIER_LOG_FILE",
+    os.path.join(tempfile.gettempdir(), "photo_classifier.log"),
+)
+try:
+    _file_handler = logging.handlers.RotatingFileHandler(
+        _log_file_path,
+        maxBytes=5 * 1024 * 1024,  # 5MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(_log_formatter)
+    logger.addHandler(_file_handler)
+except OSError as e:
+    logger.warning("无法创建日志文件 %s: %s，仅使用控制台输出", _log_file_path, e)
 
 # ============================================================
 # 将项目根目录加入 Python 路径
@@ -83,8 +106,8 @@ FILE_MAGIC_NUMBERS = {
     '.webp': (b'RIFF',),       # WebP 以 RIFF 开头，后跟 4 字节长度 + WEBP
     '.tiff': (b'II\x2a\x00', b'MM\x00\x2a'),  # Little/Big endian TIFF
     '.tif':  (b'II\x2a\x00', b'MM\x00\x2a'),
-    '.heic': (b'ftypheic',),
-    '.heif': (b'ftypmif1', b'ftypisom'),
+    '.heic': (b'ftypheic', b'ftypmif1', b'ftypisom', b'ftypheix', b'ftyphevc', b'ftypmsf1'),
+    '.heif': (b'ftypmif1', b'ftypisom', b'ftypheic', b'ftypmsf1'),
 }
 
 # 需要保护的系统敏感路径（禁止访问）
@@ -99,8 +122,19 @@ PROTECTED_PATHS = {
 RATE_LIMIT_MAX_REQUESTS = 60
 RATE_LIMIT_WINDOW = 60  # 秒
 
-# CSRF Token 使用的密钥（生产环境应从环境变量读取）
-CSRF_SECRET_KEY = os.environ.get("CSRF_SECRET_KEY", "photo-classifier-csrf-secret-key-2024")
+# CSRF Token 使用的密钥（生产环境必须从环境变量设置）
+_csrf_key_from_env = os.environ.get("CSRF_SECRET_KEY")
+if _csrf_key_from_env:
+    CSRF_SECRET_KEY = _csrf_key_from_env
+else:
+    CSRF_SECRET_KEY = os.urandom(32).hex()
+    warnings.warn(
+        "CSRF_SECRET_KEY 环境变量未设置，已生成随机密钥。"
+        "每次重启后 CSRF Token 将失效。"
+        "生产环境请务必设置 CSRF_SECRET_KEY 环境变量。",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 # 删除操作确认 Token 有效期（秒）
 DELETE_TOKEN_EXPIRE = 300  # 5 分钟
@@ -162,6 +196,12 @@ def validate_file_magic(file_path: str, extension: str) -> bool:
             header = f.read(16)  # 读取前 16 字节用于判断
 
         for magic in magic_list:
+            # HEIC/HEIF: ftyp 盒子位于偏移量 4 处（前4字节为盒子大小）
+            if extension in ('.heic', '.heif'):
+                if len(header) >= 12 and header[4:4+len(magic)] == magic:
+                    return True
+                continue
+
             if header.startswith(magic):
                 # WebP 需要额外验证：RIFF + 4字节长度 + WEBP
                 if extension == '.webp' and len(header) >= 12:
@@ -357,7 +397,10 @@ class RateLimiter:
     """
     基于内存的 IP 请求频率限制器
     每个 IP 在指定时间窗口内最多允许 N 次请求
+    自动清理过期记录，限制最大 IP 数防止内存泄漏
     """
+
+    MAX_IPS = 10000  # 最大追踪 IP 数量
 
     def __init__(self, max_requests: int = RATE_LIMIT_MAX_REQUESTS,
                  window: int = RATE_LIMIT_WINDOW):
@@ -366,6 +409,7 @@ class RateLimiter:
         # {ip: [timestamp1, timestamp2, ...]}
         self._requests: dict[str, list] = defaultdict(list)
         self._lock = threading.Lock()
+        self._last_cleanup = time.time()
 
     def is_allowed(self, ip: str) -> bool:
         """
@@ -381,10 +425,20 @@ class RateLimiter:
         cutoff = now - self.window
 
         with self._lock:
-            # 清理过期的请求记录
+            # 定期自动清理过期记录（每次调用时检查，至少间隔 60 秒）
+            if now - self._last_cleanup >= 60:
+                self._do_cleanup(now, cutoff)
+                self._last_cleanup = now
+
+            # 清理当前 IP 的过期记录
             self._requests[ip] = [
                 t for t in self._requests[ip] if t > cutoff
             ]
+
+            # 如果 IP 数超过上限，拒绝新 IP 的请求
+            if ip not in self._requests and len(self._requests) >= self.MAX_IPS:
+                logger.warning("请求频率限制器 IP 数已达上限: %d", self.MAX_IPS)
+                return False
 
             if len(self._requests[ip]) >= self.max_requests:
                 logger.warning("请求频率限制触发: ip=%s, 请求数=%d",
@@ -394,18 +448,22 @@ class RateLimiter:
             self._requests[ip].append(now)
             return True
 
+    def _do_cleanup(self, now: float, cutoff: float):
+        """清理所有过期的请求记录"""
+        expired_ips = []
+        for ip, timestamps in self._requests.items():
+            self._requests[ip] = [t for t in timestamps if t > cutoff]
+            if not self._requests[ip]:
+                expired_ips.append(ip)
+        for ip in expired_ips:
+            del self._requests[ip]
+
     def cleanup(self):
         """清理所有过期的请求记录"""
         now = time.time()
         cutoff = now - self.window
         with self._lock:
-            expired_ips = []
-            for ip, timestamps in self._requests.items():
-                self._requests[ip] = [t for t in timestamps if t > cutoff]
-                if not self._requests[ip]:
-                    expired_ips.append(ip)
-            for ip in expired_ips:
-                del self._requests[ip]
+            self._do_cleanup(now, cutoff)
 
 
 # ============================================================
@@ -496,8 +554,14 @@ def create_app(_test_scan_state=None) -> Flask:
     rate_limiter = RateLimiter()
     temp_cleaner = TempFileCleaner()
 
-    # 全局分类器实例
-    classifier = PhotoClassifier()
+    # 线程本地分类器实例（线程安全）
+    _thread_local = threading.local()
+
+    def _get_classifier():
+        """获取当前线程的分类器实例"""
+        if not hasattr(_thread_local, 'classifier'):
+            _thread_local.classifier = PhotoClassifier()
+        return _thread_local.classifier
 
     # 扫描状态（允许测试注入）
     scan_state = _test_scan_state if _test_scan_state is not None else {
@@ -510,9 +574,11 @@ def create_app(_test_scan_state=None) -> Flask:
         "temp_dir": None,  # 存储上传文件的临时目录
         "removed_paths": set(),  # 用户手动移除的废片路径
     }
+    scan_state_lock = threading.Lock()
 
-    # 缩略图缓存 {path: base64_string}
-    thumbnail_cache = {}
+    # 缩略图 LRU 缓存（最大 1000 条）
+    THUMBNAIL_CACHE_MAX = 1000
+    thumbnail_cache = OrderedDict()
 
     # 启动临时文件清理器
     temp_cleaner.start()
@@ -616,13 +682,34 @@ def create_app(_test_scan_state=None) -> Flask:
         返回:
             base64 编码的缩略图字符串，失败返回 None
         """
+        # LRU 缓存查找：命中时移动到末尾
         if image_path in thumbnail_cache:
+            thumbnail_cache.move_to_end(image_path)
             return thumbnail_cache[image_path]
 
         try:
             from PIL import Image
 
+            # 限制原始图片大小：文件不超过 20MB，像素不超过 10000x10000
+            try:
+                file_stat = os.stat(image_path)
+                if file_stat.st_size > 20 * 1024 * 1024:
+                    logger.warning("缩略图生成跳过：文件过大 %s (%.1fMB)",
+                                   os.path.basename(image_path),
+                                   file_stat.st_size / (1024 * 1024))
+                    return None
+            except OSError:
+                return None
+
             img = Image.open(image_path)
+
+            # 检查像素尺寸限制
+            if img.width > 10000 or img.height > 10000:
+                logger.warning("缩略图生成跳过：图片尺寸过大 %s (%dx%d)",
+                               os.path.basename(image_path), img.width, img.height)
+                img.close()
+                return None
+
             img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
 
             buffer = BytesIO()
@@ -638,11 +725,17 @@ def create_app(_test_scan_state=None) -> Flask:
                 fmt = 'JPEG'
 
             img.save(buffer, format=fmt, quality=80)
+            img.close()
             b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
             mime = 'image/jpeg' if fmt == 'JPEG' else f'image/{fmt.lower()}'
             result = f"data:{mime};base64,{b64}"
 
+            # LRU 缓存写入：超出上限时淘汰最旧的条目
             thumbnail_cache[image_path] = result
+            thumbnail_cache.move_to_end(image_path)
+            while len(thumbnail_cache) > THUMBNAIL_CACHE_MAX:
+                thumbnail_cache.popitem(last=False)
+
             return result
         except Exception:
             return None
@@ -753,6 +846,7 @@ def create_app(_test_scan_state=None) -> Flask:
 
             # 创建临时目录存储上传的文件
             temp_dir = tempfile.mkdtemp(prefix="photo_classifier_")
+            os.chmod(temp_dir, 0o700)
             folder_path = temp_dir
             total_size = 0
 
@@ -812,10 +906,11 @@ def create_app(_test_scan_state=None) -> Flask:
             # 扫描图片文件
             image_files = PhotoClassifier.scan_directory(folder_path)
 
-        if scan_state["is_scanning"]:
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            return jsonify({"error": "正在扫描中，请等待完成"}), 400
+        with scan_state_lock:
+            if scan_state["is_scanning"]:
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                return jsonify({"error": "正在扫描中，请等待完成"}), 400
 
         if not image_files:
             if temp_dir:
@@ -823,33 +918,38 @@ def create_app(_test_scan_state=None) -> Flask:
             return jsonify({"error": "未找到图片文件"}), 400
 
         # 重置状态
-        scan_state["is_scanning"] = True
-        scan_state["progress"] = 0
-        scan_state["total"] = len(image_files)
-        scan_state["current_file"] = ""
-        scan_state["results"] = {}
-        scan_state["removed_paths"] = set()
-        scan_state["error"] = None
-        scan_state["temp_dir"] = temp_dir
+        with scan_state_lock:
+            scan_state["is_scanning"] = True
+            scan_state["progress"] = 0
+            scan_state["total"] = len(image_files)
+            scan_state["current_file"] = ""
+            scan_state["results"] = {}
+            scan_state["removed_paths"] = set()
+            scan_state["error"] = None
+            scan_state["temp_dir"] = temp_dir
         thumbnail_cache.clear()
 
         def run_scan():
             """在后台线程中执行扫描"""
             try:
                 def progress_callback(current, total, path):
-                    scan_state["progress"] = current
-                    scan_state["total"] = total
-                    scan_state["current_file"] = os.path.basename(path)
+                    with scan_state_lock:
+                        scan_state["progress"] = current
+                        scan_state["total"] = total
+                        scan_state["current_file"] = os.path.basename(path)
 
-                results = classifier.classify_batch(image_files, progress_callback)
-                scan_state["results"] = results
+                results = _get_classifier().classify_batch(image_files, progress_callback)
+                with scan_state_lock:
+                    scan_state["results"] = results
             except Exception as e:
                 # 错误信息脱敏后存储
-                scan_state["error"] = sanitize_error_message(e)
+                with scan_state_lock:
+                    scan_state["error"] = sanitize_error_message(e)
                 logger.error("扫描过程出错: %s", sanitize_error_message(e))
             finally:
-                scan_state["is_scanning"] = False
-                scan_state["current_file"] = ""
+                with scan_state_lock:
+                    scan_state["is_scanning"] = False
+                    scan_state["current_file"] = ""
 
         # 启动后台扫描线程
         thread = threading.Thread(target=run_scan, daemon=True)
@@ -867,56 +967,57 @@ def create_app(_test_scan_state=None) -> Flask:
     @app.route("/api/status", methods=["GET"])
     def status():
         """获取扫描进度"""
-        response = {
-            "is_scanning": scan_state["is_scanning"],
-            "progress": scan_state["progress"],
-            "total": scan_state["total"],
-            "current_file": scan_state["current_file"],
-            "error": scan_state["error"],
-        }
+        with scan_state_lock:
+            response = {
+                "is_scanning": scan_state["is_scanning"],
+                "progress": scan_state["progress"],
+                "total": scan_state["total"],
+                "current_file": scan_state["current_file"],
+                "error": scan_state["error"],
+            }
 
-        if not scan_state["is_scanning"] and scan_state["results"]:
-            normal_photos = []
-            defective_photos = {}
-            removed = scan_state["removed_paths"]
+            if not scan_state["is_scanning"] and scan_state["results"]:
+                normal_photos = []
+                defective_photos = {}
+                removed = set(scan_state["removed_paths"])  # 复制一份避免竞态
 
-            for path, results in scan_state["results"].items():
-                if path in removed:
-                    normal_photos.append({
-                        "path": path,
-                        "filename": os.path.basename(path),
-                        "thumbnail": generate_thumbnail(path),
-                    })
-                    continue
-                defects = [r for r in results if r.is_defective]
-
-                if defects:
-                    # 按缺陷类型分组
-                    for defect in defects:
-                        dtype = defect.defect_type.value if defect.defect_type else "unknown"
-                        if dtype not in defective_photos:
-                            defective_photos[dtype] = []
-                        defective_photos[dtype].append({
+                for path, results in scan_state["results"].items():
+                    if path in removed:
+                        normal_photos.append({
                             "path": path,
                             "filename": os.path.basename(path),
-                            "defect_type": dtype,
-                            "confidence": defect.confidence,
-                            "description": defect.description,
                             "thumbnail": generate_thumbnail(path),
                         })
-                else:
-                    normal_photos.append({
-                        "path": path,
-                        "filename": os.path.basename(path),
-                        "thumbnail": generate_thumbnail(path),
-                    })
+                        continue
+                    defects = [r for r in results if r.is_defective]
 
-            response["completed"] = True
-            response["normal_count"] = len(normal_photos)
-            response["defective_count"] = sum(len(v) for v in defective_photos.values())
-            response["normal_photos"] = normal_photos
-            response["defective_photos"] = defective_photos
-            response["is_upload"] = scan_state["temp_dir"] is not None
+                    if defects:
+                        # 按缺陷类型分组
+                        for defect in defects:
+                            dtype = defect.defect_type.value if defect.defect_type else "unknown"
+                            if dtype not in defective_photos:
+                                defective_photos[dtype] = []
+                            defective_photos[dtype].append({
+                                "path": path,
+                                "filename": os.path.basename(path),
+                                "defect_type": dtype,
+                                "confidence": defect.confidence,
+                                "description": defect.description,
+                                "thumbnail": generate_thumbnail(path),
+                            })
+                    else:
+                        normal_photos.append({
+                            "path": path,
+                            "filename": os.path.basename(path),
+                            "thumbnail": generate_thumbnail(path),
+                        })
+
+                response["completed"] = True
+                response["normal_count"] = len(normal_photos)
+                response["defective_count"] = sum(len(v) for v in defective_photos.values())
+                response["normal_photos"] = normal_photos
+                response["defective_photos"] = defective_photos
+                response["is_upload"] = scan_state["temp_dir"] is not None
 
         return jsonify(response)
 
@@ -947,17 +1048,18 @@ def create_app(_test_scan_state=None) -> Flask:
         file_paths = []
         selected = data.get("selected", [])
 
-        if selected:
-            # 手动模式：使用前端选中的文件
-            for path in selected:
-                if path in scan_state["results"]:
-                    file_paths.append(path)
-        else:
-            # 自动模式：所有废片
-            for path, results in scan_state["results"].items():
-                defects = [r for r in results if r.is_defective]
-                if defects:
-                    file_paths.append(path)
+        with scan_state_lock:
+            if selected:
+                # 手动模式：使用前端选中的文件
+                for path in selected:
+                    if path in scan_state["results"]:
+                        file_paths.append(path)
+            else:
+                # 自动模式：所有废片
+                for path, results in scan_state["results"].items():
+                    defects = [r for r in results if r.is_defective]
+                    if defects:
+                        file_paths.append(path)
 
         if not file_paths:
             return jsonify({"error": "没有需要处理的废片"}), 400
@@ -984,10 +1086,10 @@ def create_app(_test_scan_state=None) -> Flask:
 
         file_path = data["path"]
 
-        if not scan_state["results"] or file_path not in scan_state["results"]:
-            return jsonify({"error": "文件不在扫描结果中"}), 400
-
-        scan_state["removed_paths"].add(file_path)
+        with scan_state_lock:
+            if not scan_state["results"] or file_path not in scan_state["results"]:
+                return jsonify({"error": "文件不在扫描结果中"}), 400
+            scan_state["removed_paths"].add(file_path)
         logger.info("手动移除废片标记: %s", sanitize_error_message(file_path))
 
         return jsonify({"message": "已标记为正常", "path": file_path})
@@ -1034,32 +1136,33 @@ def create_app(_test_scan_state=None) -> Flask:
         if not isinstance(selected, list):
             return jsonify({"error": "参数格式错误"}), 400
 
-        if scan_state["is_scanning"]:
-            return jsonify({"error": "正在扫描中，请等待完成"}), 400
+        with scan_state_lock:
+            if scan_state["is_scanning"]:
+                return jsonify({"error": "正在扫描中，请等待完成"}), 400
 
-        # 构建废片字典
-        defective_images = {}
+            # 构建废片字典
+            defective_images = {}
 
-        if mode == "manual" and selected:
-            # 手动模式：只处理选中的照片
-            for path in selected:
-                if path in scan_state["results"]:
-                    defects = [r for r in scan_state["results"][path] if r.is_defective]
+            if mode == "manual" and selected:
+                # 手动模式：只处理选中的照片
+                for path in selected:
+                    if path in scan_state["results"]:
+                        defects = [r for r in scan_state["results"][path] if r.is_defective]
+                        if defects:
+                            defective_images[path] = defects
+            else:
+                # 自动模式：处理所有废片
+                for path, results in scan_state["results"].items():
+                    defects = [r for r in results if r.is_defective]
                     if defects:
                         defective_images[path] = defects
-        else:
-            # 自动模式：处理所有废片
-            for path, results in scan_state["results"].items():
-                defects = [r for r in results if r.is_defective]
-                if defects:
-                    defective_images[path] = defects
 
-        if not defective_images:
-            return jsonify({"error": "没有需要处理的废片"}), 400
+            if not defective_images:
+                return jsonify({"error": "没有需要处理的废片"}), 400
 
-        # 如果是上传的文件，使用临时目录作为目标
-        if scan_state["temp_dir"]:
-            folder_path = scan_state["temp_dir"]
+            # 如果是上传的文件，使用临时目录作为目标
+            if scan_state["temp_dir"]:
+                folder_path = scan_state["temp_dir"]
 
         if not folder_path or not os.path.isdir(folder_path):
             return jsonify({"error": "无效的文件夹路径"}), 400
@@ -1070,12 +1173,13 @@ def create_app(_test_scan_state=None) -> Flask:
             return jsonify({"error": "无效的文件夹路径"}), 400
 
         if action == "move":
-            moved = classifier.move_defective(defective_images, folder_path, mode="move")
+            moved = _get_classifier().move_defective(defective_images, folder_path, mode="move")
 
             # 清理临时目录
-            if scan_state["temp_dir"]:
-                shutil.rmtree(scan_state["temp_dir"], ignore_errors=True)
-                scan_state["temp_dir"] = None
+            with scan_state_lock:
+                if scan_state["temp_dir"]:
+                    shutil.rmtree(scan_state["temp_dir"], ignore_errors=True)
+                    scan_state["temp_dir"] = None
 
             return jsonify({
                 "message": f"已移动 {len(moved)} 张废片到 '{folder_path}/废片/' 文件夹",
@@ -1099,19 +1203,41 @@ def create_app(_test_scan_state=None) -> Flask:
                     if not is_path_safe(path):
                         logger.warning("删除操作跳过不安全路径: %s", path)
                         continue
-                    # 防御符号链接攻击
-                    if os.path.islink(path):
-                        logger.warning("删除操作跳过符号链接: %s", path)
+
+                    # 防御符号链接攻击：使用 lstat 检查 + O_NOFOLLOW 原子操作
+                    # 避免 TOCTOU 竞态条件（先 islink 再 remove 的检查与操作之间可能被替换）
+                    try:
+                        st = os.lstat(path)
+                        if not os.path.stat.S_ISREG(st.st_mode):
+                            logger.warning("删除操作跳过非普通文件: %s", path)
+                            continue
+                    except OSError:
                         continue
-                    os.remove(path)
+
+                    # 使用 O_NOFOLLOW 标志打开文件描述符，防止符号链接
+                    try:
+                        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    except OSError as e:
+                        if e.errno == errno.ELOOP:
+                            logger.warning("删除操作跳过符号链接: %s", path)
+                        else:
+                            logger.warning("删除文件打开失败: %s", sanitize_error_message(e))
+                        continue
+
+                    try:
+                        os.unlink(path)
+                    finally:
+                        os.close(fd)
+
                     deleted.append(path)
                 except OSError as e:
                     logger.warning("删除文件失败: %s", sanitize_error_message(e))
 
             # 清理临时目录
-            if scan_state["temp_dir"]:
-                shutil.rmtree(scan_state["temp_dir"], ignore_errors=True)
-                scan_state["temp_dir"] = None
+            with scan_state_lock:
+                if scan_state["temp_dir"]:
+                    shutil.rmtree(scan_state["temp_dir"], ignore_errors=True)
+                    scan_state["temp_dir"] = None
 
             return jsonify({
                 "message": f"已删除 {len(deleted)} 张废片",

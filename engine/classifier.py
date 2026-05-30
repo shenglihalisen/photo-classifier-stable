@@ -5,15 +5,18 @@
 """
 
 import os
+import logging
 import shutil
 from typing import Callable
 
-from classifiers.base import DetectionResult, DefectType
+from classifiers.base import DetectionResult, DefectType, MAX_FILE_SIZE
 from classifiers.corrupted import CorruptedDetector
 from classifiers.empty import EmptyDetector
 from classifiers.blink import BlinkDetector
 from classifiers.blur import BlurDetector
 from classifiers.obstruction import ObstructionDetector
+
+logger = logging.getLogger("photo_classifier.engine")
 
 
 # 支持的图片扩展名
@@ -53,6 +56,29 @@ class PhotoClassifier:
         返回:
             检测结果列表
         """
+        # 文件大小预检查
+        try:
+            file_size = os.path.getsize(image_path)
+            if file_size > MAX_FILE_SIZE:
+                logger.warning(
+                    f"文件过大，跳过分类: {image_path} "
+                    f"(大小={file_size / 1024 / 1024:.1f}MB, 上限={MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
+                )
+                return [DetectionResult(
+                    is_defective=False,
+                    defect_type=None,
+                    confidence=0.0,
+                    description=f"文件过大({file_size / 1024 / 1024:.1f}MB)，跳过所有检测"
+                )]
+        except OSError as e:
+            logger.error(f"无法获取文件信息: {image_path}, 错误: {e}")
+            return [DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.0,
+                description=f"无法获取文件信息: {e}"
+            )]
+
         results = []
 
         for detector in self.detectors:
@@ -182,7 +208,7 @@ class PhotoClassifier:
                     shutil.copy2(image_path, target_path)
                 moved_files[image_path] = target_path
             except (OSError, shutil.Error) as e:
-                print(f"操作文件失败 {image_path}: {e}")
+                logger.error(f"操作文件失败 {image_path}: {e}")
 
         return moved_files
 

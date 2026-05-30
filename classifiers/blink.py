@@ -6,7 +6,6 @@
 强制使用 MediaPipe，加载失败时抛出错误
 """
 
-import os
 import platform
 import logging
 import cv2
@@ -20,6 +19,10 @@ import mediapipe as mp
 logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
 
 from .base import BaseDetector, DetectionResult, DefectType
+from .utils import FaceLandmarkerFactory
+
+# 图像像素数上限（防止超大图片导致内存溢出）
+MAX_IMAGE_PIXELS = 89478485  # 约 9500x9400
 
 
 class BlinkDetector(BaseDetector):
@@ -42,34 +45,25 @@ class BlinkDetector(BaseDetector):
     def __init__(self):
         self._face_landmarker = None
 
+    def __del__(self):
+        """释放 FaceLandmarker 资源"""
+        if self._face_landmarker is not None:
+            try:
+                self._face_landmarker.close()
+                logger.info("BlinkDetector: FaceLandmarker 资源已释放")
+            except Exception as e:
+                logger.warning(f"BlinkDetector: 释放 FaceLandmarker 资源时出错: {e}")
+            finally:
+                self._face_landmarker = None
+
     @property
     def defect_type(self) -> DefectType:
         return DefectType.BLINK
 
     def _get_face_landmarker(self):
-        """获取 FaceLandmarker 实例（延迟初始化）"""
+        """获取 FaceLandmarker 实例（使用单例工厂）"""
         if self._face_landmarker is None:
-            from mediapipe.tasks import python
-            from mediapipe.tasks.python import vision
-
-            model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
-
-            if not os.path.exists(model_path):
-                raise FileNotFoundError(f"模型文件不存在: {model_path}")
-
-            with open(model_path, "rb") as f:
-                model_data = f.read()
-
-            self._face_landmarker = vision.FaceLandmarker.create_from_options(
-                vision.FaceLandmarkerOptions(
-                    base_options=python.BaseOptions(model_asset_buffer=model_data),
-                    running_mode=vision.RunningMode.IMAGE,
-                    num_faces=5,
-                    min_face_detection_confidence=0.5,
-                )
-            )
-            logger.info("FaceLandmarker 初始化成功")
-
+            self._face_landmarker = FaceLandmarkerFactory.get_instance()
         return self._face_landmarker
 
     def detect(self, image_path: str) -> DetectionResult:
@@ -81,6 +75,20 @@ class BlinkDetector(BaseDetector):
                 defect_type=None,
                 confidence=0.0,
                 description="无法读取图像，跳过闭眼检测"
+            )
+
+        # 检查图像像素数是否超出限制
+        h, w = img.shape[:2]
+        if h * w > MAX_IMAGE_PIXELS:
+            logger.warning(
+                f"图像像素数过大，跳过闭眼检测: {image_path} "
+                f"({w}x{h}={h * w}, 上限={MAX_IMAGE_PIXELS})"
+            )
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=0.0,
+                description=f"图像像素数过大({w}x{h})，跳过闭眼检测"
             )
 
         rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)

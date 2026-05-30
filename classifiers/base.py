@@ -4,9 +4,16 @@
 定义所有检测器的抽象基类、缺陷类型枚举和检测结果数据类
 """
 
+import os
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
+
+logger = logging.getLogger("photo_classifier.base")
+
+# 文件大小上限（100MB）
+MAX_FILE_SIZE = 100 * 1024 * 1024
 
 
 class DefectType(Enum):
@@ -60,11 +67,26 @@ class BaseDetector(ABC):
         import cv2
         import numpy as np
         try:
+            # 文件大小检查
+            file_size = os.path.getsize(image_path)
+            if file_size > MAX_FILE_SIZE:
+                logger.warning(
+                    f"文件过大，跳过读取: {image_path} "
+                    f"(大小={file_size / 1024 / 1024:.1f}MB, 上限={MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
+                )
+                return None
+
             with open(image_path, 'rb') as f:
                 data = np.frombuffer(f.read(), dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+            if img is None:
+                logger.warning(f"图像解码失败: {image_path}")
             return img
-        except Exception:
+        except FileNotFoundError:
+            logger.warning(f"文件不存在: {image_path}")
+            return None
+        except Exception as e:
+            logger.error(f"读取图像异常: {image_path}, 错误: {e}")
             return None
 
     @property
