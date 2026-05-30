@@ -1,0 +1,65 @@
+# Docker ignore - 推送到Docker镜像时忽略的文件
+
+# Git相关
+.git
+.gitignore
+
+# Python缓存
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 测试文件
+tests/
+*.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 桌面端（Docker版本只运行Web端）
+desktop/
+
+# 桌面端入口（Docker版本不需要）
+run_desktop.py
+
+# 发行版和打包文件
+dist/
+build/
+*.exe
+*.spec
+
+# 文档和说明（可选保留）
+# README.md
+# CHANGELOG.md
+
+# 环境配置
+.env
+.env.local
+
+# 日志文件
+*.log
+logs/
+
+# 临时文件
+*.tmp
+*.temp
+tmp/
+temp/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# 其他
+.editorconfig
+.pre-commit-config.yaml
