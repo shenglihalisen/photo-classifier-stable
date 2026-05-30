@@ -1,47 +1,41 @@
 # Photo Classifier - Docker Compose 配置
-# 照片自动分类工具 Docker Compose 版本
-
-version: '3.8'
+# 照片自动分类工具 Docker 版本（仅上传模式）
+#
+# 使用方式：
+#   docker compose up -d
+#   浏览器访问 http://localhost:5000
+#
+# 无需挂载本地目录，直接通过Web界面上传照片即可
 
 services:
   photo-classifier:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: photo-classifier:latest
+    # 直接拉取预构建镜像（无需本地构建）
+    image: ghcr.io/shenglihalisen/photo-classifier-stable:latest
     container_name: photo-classifier-web
-    
-    # 端口映射
+
+    # 端口映射（可修改左侧端口号）
     ports:
       - "5000:5000"
-    
+
     # 环境变量
     environment:
       - FLASK_ENV=production
-      - CSRF_SECRET_KEY=${CSRF_SECRET_KEY:-your-secret-key-change-in-production}
+      # CSRF密钥（生产环境请修改为随机字符串）
+      - CSRF_SECRET_KEY=${CSRF_SECRET_KEY:-photo-classifier-csrf-secret-key-2024}
       - TZ=Asia/Shanghai
-    
-    # 数据卷映射
-    # 将本地照片目录映射到容器内，以便扫描
-    volumes:
-      # 照片目录映射（请根据实际情况修改）
-      # 格式：本地路径:容器路径
-      - ${PHOTO_DIR:-./photos}:/data/photos:ro
-      # 上传目录（用于临时存储上传的文件）
-      - uploads-data:/app/uploads
-    
+
     # 重启策略
     restart: unless-stopped
-    
+
     # 健康检查
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/api/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
-    
-    # 资源限制（可选）
+      start_period: 15s
+
+    # 资源限制
     deploy:
       resources:
         limits:
@@ -50,11 +44,11 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
-    
+
     # 安全配置
     security_opt:
       - no-new-privileges:true
-    
+
     # 日志配置
     logging:
       driver: "json-file"
@@ -62,12 +56,6 @@ services:
         max-size: "10m"
         max-file: "3"
 
-# 数据卷定义
-volumes:
-  uploads-data:
-    driver: local
-
-# 网络配置（可选）
 networks:
   default:
     name: photo-classifier-network
