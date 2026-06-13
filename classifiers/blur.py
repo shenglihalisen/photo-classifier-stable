@@ -28,23 +28,30 @@ class BlurDetector(BaseDetector):
     def defect_type(self) -> DefectType:
         return DefectType.BLURRY
 
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """检测图片是否模糊"""
         try:
-            img = self.read_image(image_path)
-            if img is None:
-                return DetectionResult(
-                    is_defective=False,
-                    defect_type=None,
-                    confidence=0.0,
-                    description="无法读取图像，跳过模糊检测"
-                )
-
-            # 转换为灰度图
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            if precomputed is not None:
+                gray = precomputed.gray
+                mean_brightness = precomputed.mean_brightness
+                laplacian_var = precomputed.laplacian_var
+            else:
+                if image is None:
+                    img = self.read_image(image_path)
+                else:
+                    img = image
+                if img is None:
+                    return DetectionResult(
+                        is_defective=False,
+                        defect_type=None,
+                        confidence=0.0,
+                        description="无法读取图像，跳过模糊检测"
+                    )
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                mean_brightness = float(np.mean(gray))
+                laplacian_var = self._calculate_laplacian_variance(gray)
 
             # 跳过纯黑/纯白图像（这些由空镜检测器负责）
-            mean_brightness = float(np.mean(gray))
             if mean_brightness < 15 or mean_brightness > 240:
                 return DetectionResult(
                     is_defective=False,
@@ -53,10 +60,7 @@ class BlurDetector(BaseDetector):
                     description=f"图像亮度异常(均值={mean_brightness:.1f})，跳过模糊检测"
                 )
 
-            # 1. 拉普拉斯方差检测
-            laplacian_var = self._calculate_laplacian_variance(gray)
-
-            # 2. Sobel 边缘检测
+            # Sobel 边缘检测
             sobel_score = self._calculate_sobel_score(gray)
 
             # 综合评分

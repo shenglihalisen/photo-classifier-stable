@@ -1,3 +1,39 @@
+## v3.0.0 (2026-06-13)
+
+### 新增
+- 曝光异常检测器（过曝/欠曝）
+- 噪点检测器（高 ISO 噪点）
+- 重复照片检测（pHash 感知哈希）
+- 图片预览面板（点击大图预览，滚轮缩放）
+- 标记正常功能（预览中将误判废片标记为正常）
+- 多文件下载（勾选正常照片逐个下载）
+- 打包下载（勾选正常照片打包 ZIP 下载）
+- 整页拖拽上传（拖到页面任意位置即可上传）
+- 文件夹拖拽支持（FileSystem API 递归读取）
+- PrecomputedImage 预计算加速（灰度图、拉普拉斯方差共享）
+- 多线程并行检测（ThreadPoolExecutor）
+- 并发扫描限制（信号量控制）
+- 扫描前自动清理缓存和临时文件
+- 安全响应头（X-Frame-Options、CSP、XSS-Protection）
+- Server 版本信息隐藏
+- 下载接口频率限制和 CSRF 防护
+- 文件大小限制提升至 10GB
+- Web 端 UI 全面重设计（更大布局、Tab 切换、拖拽视觉反馈）
+
+### 优化
+- 所有检测器共享灰度图和拉普拉斯方差，减少重复计算
+- 大图自动缩放至 2048px 加速处理
+- FaceDetectorMixin 提取共享代码，消除 Blink/Obstruction 重复
+- 检测器接口统一为 detect(image_path, image=None, precomputed=None)
+
+### 修复
+- Windows 路径保护双反斜杠导致匹配失败
+- ZIP 下载缺少 responseType 导致文件损坏
+- 下载接口缺少 CSRF 和频率限制
+- 错误信息泄露内部细节
+- 死代码清理（suggest_actions 后的重复代码）
+- HTML 中 readEntry 函数重复定义
+
 ## v2.0.3 (2026-05-15)
 
 ### 优化
@@ -10,10 +46,6 @@
   - /api/status 和 /api/health 移除频率限制
   - 总限流上限 30 → 60 次/分钟
 - 修复 Web 端 Tab 选中状态文字不可见的问题（选中 Tab 使用白色文字 + 紫色背景）
-
-### 下载
-- PhotoClassifier-Desktop.exe - 桌面端
-- PhotoClassifier-Web.exe - Web 端
 
 ## v2.0.2 (2026-05-15)
 

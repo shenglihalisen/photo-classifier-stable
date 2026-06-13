@@ -19,16 +19,15 @@ class CorruptedDetector(BaseDetector):
     def defect_type(self) -> DefectType:
         return DefectType.CORRUPTED
 
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """
         检测图片是否损坏
 
         检测流程:
         1. 检查文件是否存在且非空
         2. 检查文件头魔数是否有效
-        3. 尝试用 PIL 打开并验证图片
-        4. 尝试用 OpenCV 解码图片
-        5. 检查解码后的图像数据是否有效
+        3. 如果已提供 image（预解码成功），直接通过
+        4. 否则尝试用 PIL 和 OpenCV 解码验证
         """
         # 检查文件是否存在
         if not os.path.exists(image_path):
@@ -46,6 +45,15 @@ class CorruptedDetector(BaseDetector):
                 defect_type=self.defect_type,
                 confidence=1.0,
                 description="文件大小为0"
+            )
+
+        # 如果引擎已预解码成功，说明文件可正常读取
+        if image is not None:
+            return DetectionResult(
+                is_defective=False,
+                defect_type=None,
+                confidence=1.0,
+                description="文件完整，未检测到损坏"
             )
 
         # 检查文件头魔数

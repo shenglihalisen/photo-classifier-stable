@@ -19,13 +19,10 @@ import mediapipe as mp
 logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
 
 from .base import BaseDetector, DetectionResult, DefectType
-from .utils import FaceLandmarkerFactory
-
-# 图像像素数上限（防止超大图片导致内存溢出）
-MAX_IMAGE_PIXELS = 89478485  # 约 9500x9400
+from .utils import FaceDetectorMixin, MAX_IMAGE_PIXELS
 
 
-class ObstructionDetector(BaseDetector):
+class ObstructionDetector(BaseDetector, FaceDetectorMixin):
     """
     遮挡检测器
 
@@ -39,36 +36,24 @@ class ObstructionDetector(BaseDetector):
     CORNER_UNIFORMITY_THRESHOLD = 12
     CORNER_CHECK_SIZE = 0.15
 
-    SKIN_LOWER = np.array([0, 20, 50], dtype=np.uint8)
-    SKIN_UPPER = np.array([25, 180, 255], dtype=np.uint8)
-
     def __init__(self):
-        self._face_landmarker = None
+        self._init_face_detector()
+        self._skin_lower = np.array([0, 20, 50], dtype=np.uint8)
+        self._skin_upper = np.array([25, 180, 255], dtype=np.uint8)
 
     def __del__(self):
-        """释放 FaceLandmarker 资源"""
-        if self._face_landmarker is not None:
-            try:
-                self._face_landmarker.close()
-                logger.info("ObstructionDetector: FaceLandmarker 资源已释放")
-            except Exception as e:
-                logger.warning(f"ObstructionDetector: 释放 FaceLandmarker 资源时出错: {e}")
-            finally:
-                self._face_landmarker = None
+        self._release_face_detector()
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.OBSTRUCTION
 
-    def _get_face_landmarker(self):
-        """获取 FaceLandmarker 实例（使用单例工厂）"""
-        if self._face_landmarker is None:
-            self._face_landmarker = FaceLandmarkerFactory.get_instance()
-        return self._face_landmarker
-
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """检测图片是否存在遮挡"""
-        img = self.read_image(image_path)
+        if image is None:
+            img = self.read_image(image_path)
+        else:
+            img = image
         if img is None:
             return DetectionResult(
                 is_defective=False,
@@ -78,8 +63,8 @@ class ObstructionDetector(BaseDetector):
             )
 
         # 检查图像像素数是否超出限制
-        h, w = img.shape[:2]
-        if h * w > MAX_IMAGE_PIXELS:
+        if not self._check_pixel_limit(img):
+            h, w = img.shape[:2]
             logger.warning(
                 f"图像像素数过大，跳过遮挡检测: {image_path} "
                 f"({w}x{h}={h * w}, 上限={MAX_IMAGE_PIXELS})"
@@ -229,7 +214,7 @@ class ObstructionDetector(BaseDetector):
             return {"is_obstructed": False, "confidence": 0.0, "description": ""}
 
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        skin_mask = cv2.inRange(hsv, self.SKIN_LOWER, self.SKIN_UPPER)
+        skin_mask = cv2.inRange(hsv, self._skin_lower, self._skin_upper)
 
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         skin_mask = cv2.morphologyEx(skin_mask, cv2.MORPH_CLOSE, kernel, iterations=2)

@@ -1,10 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Flask Web 应用 - 安全增强版
-照片自动分类工具的 Web 端
-
 安全防护:
-  - 文件上传大小限制（单文件50MB，总200MB）
+  - 文件上传大小限制（单文件10GB，总10GB）
   - 文件类型白名单验证（检查文件头魔数）
   - 路径遍历攻击防护
   - CSRF Token 防护
@@ -90,8 +87,8 @@ from engine.classifier import PhotoClassifier
 # ============================================================
 
 # 文件上传大小限制
-MAX_FILE_SIZE = 50 * 1024 * 1024        # 单文件 50MB
-MAX_TOTAL_SIZE = 200 * 1024 * 1024      # 总上传 200MB
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024     # 单文件 10GB
+MAX_TOTAL_SIZE = 10 * 1024 * 1024 * 1024     # 总上传 10GB
 
 # 允许的图片扩展名
 ALLOWED_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff', '.tif', '.heic', '.heif'}
@@ -114,8 +111,8 @@ FILE_MAGIC_NUMBERS = {
 PROTECTED_PATHS = {
     '/', '/etc', '/usr', '/bin', '/sbin', '/boot', '/dev', '/proc', '/sys',
     '/var', '/tmp', '/root', '/home', '/windows', '/windows/system32',
-    'C:\\\\', 'C:\\\\Windows', 'C:\\\\Program Files', 'C:\\\\ProgramData',
-    'D:\\\\Windows', 'D:\\\\Program Files',
+    'C:\\', 'C:\\Windows', 'C:\\Program Files', 'C:\\ProgramData',
+    'D:\\Windows', 'D:\\Program Files',
 }
 
 # 请求频率限制：每 IP 每分钟最大请求数
@@ -550,9 +547,27 @@ def create_app(_test_scan_state=None) -> Flask:
     # 配置上传大小限制（Flask 内置限制，作为额外保护层）
     app.config['MAX_CONTENT_LENGTH'] = MAX_TOTAL_SIZE
 
+    # 移除 Server 头（防止版本泄露）
+    app.config['SERVER_NAME'] = None
+
+    # WSGI 中间件：移除 Server 头
+    class RemoveServerHeader:
+        def __init__(self, app):
+            self.app = app
+        def __call__(self, environ, start_response):
+            def custom_start_response(status, headers, exc_info=None):
+                headers[:] = [(k, v) for k, v in headers if k.lower() != 'server']
+                return start_response(status, headers, exc_info)
+            return self.app(environ, custom_start_response)
+
+    app.wsgi_app = RemoveServerHeader(app.wsgi_app)
+
     # 全局安全组件
     rate_limiter = RateLimiter()
     temp_cleaner = TempFileCleaner()
+
+    # 并发扫描限制（最多同时 1 个扫描任务）
+    scan_semaphore = threading.Semaphore(1)
 
     # 线程本地分类器实例（线程安全）
     _thread_local = threading.local()
@@ -564,6 +579,8 @@ def create_app(_test_scan_state=None) -> Flask:
         return _thread_local.classifier
 
     # 扫描状态（允许测试注入）
+    # 注意：当前为全局单例设计，适合单用户本地部署。
+    # 多用户并发场景需改为按 session/用户隔离。
     scan_state = _test_scan_state if _test_scan_state is not None else {
         "is_scanning": False,
         "progress": 0,
@@ -573,6 +590,7 @@ def create_app(_test_scan_state=None) -> Flask:
         "error": None,
         "temp_dir": None,  # 存储上传文件的临时目录
         "removed_paths": set(),  # 用户手动移除的废片路径
+        "duplicate_groups": [],  # 重复照片检测结果
     }
     scan_state_lock = threading.Lock()
 
@@ -582,6 +600,22 @@ def create_app(_test_scan_state=None) -> Flask:
 
     # 启动临时文件清理器
     temp_cleaner.start()
+
+    # ========================================================
+    # 安全头中间件
+    # ========================================================
+
+    @app.after_request
+    def add_security_headers(response):
+        """添加安全响应头"""
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+        response.headers['X-XSS-Protection'] = '1; mode=block'
+        response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+        response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; font-src https://cdn.jsdelivr.net"
+        # 移除服务器版本信息
+        response.headers.pop('Server', None)
+        return response
 
     # ========================================================
     # 请求日志中间件
@@ -618,8 +652,8 @@ def create_app(_test_scan_state=None) -> Flask:
 
     @app.errorhandler(413)
     def handle_413(error):
-        return jsonify({"error": f"文件大小超出限制（单文件最大 {MAX_FILE_SIZE // (1024*1024)}MB，"
-                                 f"总计最大 {MAX_TOTAL_SIZE // (1024*1024)}MB）"}), 413
+        return jsonify({"error": f"文件大小超出限制（单文件最大 {MAX_FILE_SIZE // (1024*1024*1024)}GB，"
+                                 f"总计最大 {MAX_TOTAL_SIZE // (1024*1024*1024)}GB）"}), 413
 
     @app.errorhandler(429)
     def handle_429(error):
@@ -838,127 +872,165 @@ def create_app(_test_scan_state=None) -> Flask:
         folder_path = ""
         temp_dir = None
 
-        # 检查是否有文件上传
-        if 'files' in request.files:
-            uploaded_files = request.files.getlist('files')
-            if not uploaded_files or all(f.filename == '' for f in uploaded_files):
-                return jsonify({"error": "请选择要上传的文件"}), 400
+        # 并发限制：获取信号量
+        if not scan_semaphore.acquire(blocking=False):
+            return jsonify({"error": "系统繁忙，请等待当前扫描完成"}), 429
 
-            # 创建临时目录存储上传的文件
-            temp_dir = tempfile.mkdtemp(prefix="photo_classifier_")
-            os.chmod(temp_dir, 0o700)
-            folder_path = temp_dir
-            total_size = 0
+        try:
+            # 检查是否有文件上传
+            if 'files' in request.files:
+                uploaded_files = request.files.getlist('files')
+                if not uploaded_files or all(f.filename == '' for f in uploaded_files):
+                    return jsonify({"error": "请选择要上传的文件"}), 400
 
-            for file in uploaded_files:
-                # 验证文件安全性和合法性
-                is_valid, result = validate_upload_file(file)
-                if not is_valid:
-                    logger.warning("文件上传验证失败: %s", result)
-                    continue
+                # 创建临时目录存储上传的文件
+                temp_dir = tempfile.mkdtemp(prefix="photo_classifier_")
+                os.chmod(temp_dir, 0o700)
+                folder_path = temp_dir
+                total_size = 0
 
-                safe_name = result
-                filepath = os.path.join(temp_dir, safe_name)
+                for file in uploaded_files:
+                    # 验证文件安全性和合法性
+                    is_valid, result = validate_upload_file(file)
+                    if not is_valid:
+                        logger.warning("文件上传验证失败: %s", result)
+                        continue
 
-                # 保存文件
-                file.save(filepath)
+                    safe_name = result
+                    filepath = os.path.join(temp_dir, safe_name)
 
-                # 验证文件头魔数（防止扩展名伪造）
-                ext = os.path.splitext(safe_name)[1].lower()
-                if not validate_file_magic(filepath, ext):
-                    logger.warning("文件魔数验证失败，疑似伪造文件: %s", safe_name)
-                    os.remove(filepath)
-                    continue
+                    # 保存文件
+                    file.save(filepath)
 
-                # 累计文件大小检查
-                file_stat = os.stat(filepath)
-                total_size += file_stat.st_size
-                if total_size > MAX_TOTAL_SIZE:
-                    logger.warning("总上传大小超出限制: %d bytes", total_size)
-                    os.remove(filepath)
-                    continue
+                    # 验证文件头魔数（防止扩展名伪造）
+                    ext = os.path.splitext(safe_name)[1].lower()
+                    if not validate_file_magic(filepath, ext):
+                        logger.warning("文件魔数验证失败，疑似伪造文件: %s", safe_name)
+                        os.remove(filepath)
+                        continue
 
-                image_files.append(filepath)
+                    # 累计文件大小检查
+                    file_stat = os.stat(filepath)
+                    total_size += file_stat.st_size
+                    if total_size > MAX_TOTAL_SIZE:
+                        logger.warning("总上传大小超出限制: %d bytes", total_size)
+                        os.remove(filepath)
+                        continue
+
+                    image_files.append(filepath)
+
+                if not image_files:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    return jsonify({"error": "没有有效的图片文件"}), 400
+            else:
+                # 从 JSON 获取路径
+                data = request.get_json(silent=True)
+                if not data:
+                    return jsonify({"error": "请上传文件或提供文件夹路径"}), 400
+
+                folder_path = data.get("path", "").strip()
+
+                # 输入参数校验：路径不能为空
+                if not folder_path:
+                    return jsonify({"error": "请输入文件夹路径或选择文件上传"}), 400
+
+                # 路径安全检查：防止路径遍历和敏感路径访问
+                if not is_path_safe(folder_path):
+                    logger.warning("路径安全检查失败: %s", folder_path)
+                    return jsonify({"error": "无效的文件夹路径"}), 400
+
+                if not os.path.isdir(folder_path):
+                    return jsonify({"error": "路径不存在或不是文件夹"}), 400
+
+                # 扫描图片文件
+                image_files = PhotoClassifier.scan_directory(folder_path)
+
+            # 限制单次扫描数量（防止内存溢出）
+            MAX_SCAN_FILES = 50000
+            if len(image_files) > MAX_SCAN_FILES:
+                image_files = image_files[:MAX_SCAN_FILES]
+                logger.warning("扫描数量超出限制，截断为 %d 张", MAX_SCAN_FILES)
 
             if not image_files:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return jsonify({"error": "没有有效的图片文件"}), 400
-        else:
-            # 从 JSON 获取路径
-            data = request.get_json(silent=True)
-            if not data:
-                return jsonify({"error": "请上传文件或提供文件夹路径"}), 400
-
-            folder_path = data.get("path", "").strip()
-
-            # 输入参数校验：路径不能为空
-            if not folder_path:
-                return jsonify({"error": "请输入文件夹路径或选择文件上传"}), 400
-
-            # 路径安全检查：防止路径遍历和敏感路径访问
-            if not is_path_safe(folder_path):
-                logger.warning("路径安全检查失败: %s", folder_path)
-                return jsonify({"error": "无效的文件夹路径"}), 400
-
-            if not os.path.isdir(folder_path):
-                return jsonify({"error": "路径不存在或不是文件夹"}), 400
-
-            # 扫描图片文件
-            image_files = PhotoClassifier.scan_directory(folder_path)
-
-        with scan_state_lock:
-            if scan_state["is_scanning"]:
                 if temp_dir:
                     shutil.rmtree(temp_dir, ignore_errors=True)
-                return jsonify({"error": "正在扫描中，请等待完成"}), 400
+                return jsonify({"error": "未找到图片文件"}), 400
 
-        if not image_files:
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            return jsonify({"error": "未找到图片文件"}), 400
+            # ========== 扫描前清理 ==========
+            with scan_state_lock:
+                # 清理上一次的临时文件
+                if scan_state["temp_dir"] and os.path.exists(scan_state["temp_dir"]):
+                    try:
+                        shutil.rmtree(scan_state["temp_dir"], ignore_errors=True)
+                        logger.info("已清理上一次临时目录: %s", scan_state["temp_dir"])
+                    except Exception as e:
+                        logger.warning("清理临时目录失败: %s", e)
 
-        # 重置状态
-        with scan_state_lock:
-            scan_state["is_scanning"] = True
-            scan_state["progress"] = 0
-            scan_state["total"] = len(image_files)
-            scan_state["current_file"] = ""
-            scan_state["results"] = {}
-            scan_state["removed_paths"] = set()
-            scan_state["error"] = None
-            scan_state["temp_dir"] = temp_dir
-        thumbnail_cache.clear()
+                # 重置扫描状态
+                scan_state["is_scanning"] = True
+                scan_state["progress"] = 0
+                scan_state["total"] = len(image_files)
+                scan_state["current_file"] = ""
+                scan_state["results"] = {}
+                scan_state["removed_paths"] = set()
+                scan_state["error"] = None
+                scan_state["temp_dir"] = temp_dir
+                scan_state["duplicate_groups"] = []
 
-        def run_scan():
-            """在后台线程中执行扫描"""
-            try:
-                def progress_callback(current, total, path):
+            # 清理缩略图缓存
+            thumbnail_cache.clear()
+
+            # 建议 Python GC 回收
+            import gc
+            gc.collect()
+
+            def run_scan():
+                """在后台线程中执行扫描"""
+                try:
+                    def progress_callback(current, total, path):
+                        with scan_state_lock:
+                            scan_state["progress"] = current
+                            scan_state["total"] = total
+                            scan_state["current_file"] = os.path.basename(path)
+
+                    # 分批处理，每批 100 张，避免一次性加载过多
+                    BATCH_SIZE = 100
+                    all_results = {}
+                    for batch_start in range(0, len(image_files), BATCH_SIZE):
+                        batch = image_files[batch_start:batch_start + BATCH_SIZE]
+                        batch_results = _get_classifier().classify_batch(batch, progress_callback)
+                        all_results.update(batch_results)
+
+                        # 每批处理后建议 GC
+                        if batch_start % 500 == 0 and batch_start > 0:
+                            gc.collect()
+
                     with scan_state_lock:
-                        scan_state["progress"] = current
-                        scan_state["total"] = total
-                        scan_state["current_file"] = os.path.basename(path)
+                        scan_state["results"] = all_results
+                except Exception as e:
+                    # 错误信息脱敏后存储
+                    with scan_state_lock:
+                        scan_state["error"] = sanitize_error_message(e)
+                    logger.error("扫描过程出错: %s", sanitize_error_message(e))
+                finally:
+                    with scan_state_lock:
+                        scan_state["is_scanning"] = False
+                        scan_state["current_file"] = ""
+                    # 释放信号量
+                    scan_semaphore.release()
 
-                results = _get_classifier().classify_batch(image_files, progress_callback)
-                with scan_state_lock:
-                    scan_state["results"] = results
-            except Exception as e:
-                # 错误信息脱敏后存储
-                with scan_state_lock:
-                    scan_state["error"] = sanitize_error_message(e)
-                logger.error("扫描过程出错: %s", sanitize_error_message(e))
-            finally:
-                with scan_state_lock:
-                    scan_state["is_scanning"] = False
-                    scan_state["current_file"] = ""
+            # 启动后台扫描线程
+            thread = threading.Thread(target=run_scan, daemon=True)
+            thread.start()
 
-        # 启动后台扫描线程
-        thread = threading.Thread(target=run_scan, daemon=True)
-        thread.start()
+            return jsonify({
+                "message": f"开始扫描 {len(image_files)} 张图片",
+                "total": len(image_files),
+            })
 
-        return jsonify({
-            "message": f"开始扫描 {len(image_files)} 张图片",
-            "total": len(image_files),
-        })
+        except Exception as e:
+            scan_semaphore.release()
+            raise
 
     # ========================================================
     # 路由：API - 状态查询
@@ -1018,6 +1090,17 @@ def create_app(_test_scan_state=None) -> Flask:
                 response["normal_photos"] = normal_photos
                 response["defective_photos"] = defective_photos
                 response["is_upload"] = scan_state["temp_dir"] is not None
+
+            # 返回重复照片检测结果
+            if not scan_state["is_scanning"] and scan_state.get("duplicate_groups"):
+                duplicate_info = []
+                for group in scan_state["duplicate_groups"]:
+                    duplicate_info.append({
+                        "files": [{"path": p, "filename": os.path.basename(p)} for p in group],
+                        "count": len(group),
+                    })
+                response["duplicate_groups"] = duplicate_info
+                response["duplicate_count"] = sum(len(g) for g in scan_state["duplicate_groups"])
 
         return jsonify(response)
 
@@ -1245,5 +1328,258 @@ def create_app(_test_scan_state=None) -> Flask:
             })
         else:
             return jsonify({"error": "无效的操作类型"}), 400
+
+    # ========================================================
+    # 路由：API - 重复照片检测
+    # ========================================================
+
+    @app.route("/api/duplicates", methods=["POST"])
+    @rate_limit
+    @csrf_protect
+    def find_duplicates():
+        """
+        检测重复照片
+
+        请求体:
+            {
+                "path": "/path/to/folder"  (可选，不传则使用上次扫描的文件)
+            }
+
+        返回:
+            重复照片组列表
+        """
+        data = request.get_json(silent=True) or {}
+        folder_path = data.get("path", "").strip()
+
+        if folder_path:
+            if not is_path_safe(folder_path):
+                return jsonify({"error": "无效的文件夹路径"}), 400
+            if not os.path.isdir(folder_path):
+                return jsonify({"error": "路径不存在或不是文件夹"}), 400
+            image_files = PhotoClassifier.scan_directory(folder_path)
+        else:
+            with scan_state_lock:
+                if not scan_state["results"]:
+                    return jsonify({"error": "请先扫描照片或提供文件夹路径"}), 400
+                image_files = list(scan_state["results"].keys())
+
+        if len(image_files) < 2:
+            return jsonify({"error": "图片数量不足，无法检测重复"}), 400
+
+        def run_duplicate_scan():
+            try:
+                def progress_callback(current, total, path):
+                    with scan_state_lock:
+                        scan_state["progress"] = current
+                        scan_state["total"] = total
+                        scan_state["current_file"] = os.path.basename(path)
+
+                groups = _get_classifier().find_duplicates(image_files, progress_callback)
+                with scan_state_lock:
+                    scan_state["duplicate_groups"] = groups
+            except Exception as e:
+                with scan_state_lock:
+                    scan_state["error"] = sanitize_error_message(e)
+                logger.error("重复检测出错: %s", sanitize_error_message(e))
+            finally:
+                with scan_state_lock:
+                    scan_state["is_scanning"] = False
+                    scan_state["current_file"] = ""
+
+        with scan_state_lock:
+            if scan_state["is_scanning"]:
+                return jsonify({"error": "正在检测中，请等待完成"}), 400
+            scan_state["is_scanning"] = True
+            scan_state["progress"] = 0
+            scan_state["total"] = len(image_files)
+            scan_state["current_file"] = ""
+            scan_state["error"] = None
+            scan_state["duplicate_groups"] = []
+
+        thread = threading.Thread(target=run_duplicate_scan, daemon=True)
+        thread.start()
+
+        return jsonify({
+            "message": f"开始检测 {len(image_files)} 张图片的重复项",
+            "total": len(image_files),
+        })
+
+    # ========================================================
+    # 路由：API - 下载单个文件
+    # ========================================================
+
+    @app.route("/api/download", methods=["GET"])
+    @rate_limit
+    def download_file():
+        """下载指定文件"""
+        file_path = request.args.get("path", "")
+        if not file_path:
+            return jsonify({"error": "缺少文件路径"}), 400
+
+        # 安全检查
+        if not is_path_safe(file_path):
+            return jsonify({"error": "无效的文件路径"}), 400
+
+        if not os.path.isfile(file_path):
+            return jsonify({"error": "文件不存在"}), 404
+
+        # 只允许下载扫描结果中的文件
+        with scan_state_lock:
+            all_paths = set(scan_state.get("results", {}).keys())
+            normal_paths = set()
+            if not scan_state["is_scanning"] and scan_state["results"]:
+                removed = scan_state.get("removed_paths", set())
+                for path, results in scan_state["results"].items():
+                    if path not in removed:
+                        defects = [r for r in results if r.is_defective]
+                        if not defects:
+                            normal_paths.add(path)
+
+        if file_path not in normal_paths:
+            return jsonify({"error": "只能下载正常照片"}), 403
+
+        # 文件大小检查
+        file_size = os.path.getsize(file_path)
+        MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024 * 1024  # 10GB
+        if file_size > MAX_DOWNLOAD_SIZE:
+            return jsonify({"error": f"文件过大（{file_size // (1024*1024)}MB），无法下载"}), 413
+
+        from flask import Response
+        with open(file_path, 'rb') as f:
+            data = f.read()
+        filename = os.path.basename(file_path)
+        return Response(
+            data,
+            mimetype='application/octet-stream',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"',
+                'Content-Length': str(len(data)),
+            }
+        )
+
+    # ========================================================
+    # 路由：API - 打包下载正常照片
+    # ========================================================
+
+    @app.route("/api/download-zip", methods=["GET"])
+    @rate_limit
+    def download_zip():
+        """将所有正常照片打包为 ZIP 下载"""
+        import zipfile
+        import io
+
+        with scan_state_lock:
+            if scan_state["is_scanning"]:
+                return jsonify({"error": "正在扫描中，请等待完成"}), 400
+
+            normal_paths = []
+            removed = set(scan_state.get("removed_paths", set()))
+            if scan_state["results"]:
+                for path, results in scan_state["results"].items():
+                    if path not in removed:
+                        defects = [r for r in results if r.is_defective]
+                        if not defects and os.path.isfile(path):
+                            normal_paths.append(path)
+
+        if not normal_paths:
+            return jsonify({"error": "没有正常照片可下载"}), 400
+
+        # 检查总文件大小
+        total_size = 0
+        MAX_ZIP_TOTAL = 10 * 1024 * 1024 * 1024  # 10GB
+        valid_paths = []
+        for p in normal_paths:
+            try:
+                sz = os.path.getsize(p)
+                if total_size + sz > MAX_ZIP_TOTAL:
+                    break
+                total_size += sz
+                valid_paths.append(p)
+            except OSError:
+                continue
+        normal_paths = valid_paths
+
+        return _build_zip(normal_paths)
+
+    # ========================================================
+    # 路由：API - 选中文件打包下载
+    # ========================================================
+
+    @app.route("/api/download-zip-selected", methods=["POST"])
+    @rate_limit
+    @csrf_protect
+    def download_zip_selected():
+        """将选中的文件打包为 ZIP 下载"""
+        import zipfile
+        import io
+
+        data = request.get_json(silent=True)
+        if not data or "paths" not in data:
+            return jsonify({"error": "缺少文件路径列表"}), 400
+
+        paths = data["paths"]
+        if not isinstance(paths, list) or not paths:
+            return jsonify({"error": "文件路径列表为空"}), 400
+
+        # 安全过滤：只允许下载扫描结果中的正常文件
+        valid_paths = []
+        with scan_state_lock:
+            removed = set(scan_state.get("removed_paths", set()))
+            all_results = scan_state.get("results", {})
+            for p in paths:
+                if not is_path_safe(p):
+                    continue
+                if p not in all_results:
+                    continue
+                if p in removed:
+                    continue
+                defects = [r for r in all_results[p] if r.is_defective]
+                if not defects and os.path.isfile(p):
+                    valid_paths.append(p)
+
+        if not valid_paths:
+            return jsonify({"error": "没有有效的文件可下载"}), 400
+
+        return _build_zip(valid_paths)
+
+    def _build_zip(paths):
+        """构建 ZIP 文件并返回"""
+        import zipfile
+        import io
+        from datetime import datetime as _dt
+
+        try:
+            # 限制数量
+            MAX_ZIP = 10000
+            if len(paths) > MAX_ZIP:
+                paths = paths[:MAX_ZIP]
+
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for path in paths:
+                    arcname = os.path.basename(path)
+                    if arcname in zf.namelist():
+                        name, ext = os.path.splitext(arcname)
+                        counter = 1
+                        while f"{name}_{counter}{ext}" in zf.namelist():
+                            counter += 1
+                        arcname = f"{name}_{counter}{ext}"
+                    try:
+                        zf.write(path, arcname)
+                    except Exception as e:
+                        logger.warning("打包失败 %s: %s", path, e)
+
+            zip_buffer.seek(0)
+            zip_data = zip_buffer.getvalue()
+            filename = f'photos_{_dt.now().strftime("%Y%m%d_%H%M%S")}.zip'
+
+            response = app.make_response(zip_data)
+            response.headers['Content-Type'] = 'application/zip'
+            response.headers['Content-Disposition'] = f'attachment; filename="{filename}"'
+            response.headers['Content-Length'] = str(len(zip_data))
+            return response
+        except Exception as e:
+            logger.error("构建ZIP失败: %s", e)
+            return jsonify({"error": "打包失败，请稍后重试"}), 500
 
     return app

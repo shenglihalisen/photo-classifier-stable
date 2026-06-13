@@ -70,6 +70,8 @@ DEFECT_TYPE_NAMES = {
     DefectType.BLINK: "闭眼",
     DefectType.BLURRY: "模糊",
     DefectType.OBSTRUCTION: "遮挡",
+    DefectType.EXPOSURE: "曝光异常",
+    DefectType.NOISY: "噪点",
 }
 
 # 缺陷类型英文值映射（用于报告导出）
@@ -79,6 +81,8 @@ DEFECT_TYPE_VALUE_NAMES = {
     "blink": "闭眼",
     "blurry": "模糊",
     "obstruction": "遮挡",
+    "exposure": "曝光异常",
+    "noisy": "噪点",
 }
 
 # QSettings 组织名和应用名（用于窗口状态记忆）
@@ -663,6 +667,10 @@ class DesktopApp(QMainWindow):
         action_move.triggered.connect(self._move_defective)
         op_menu.addAction(action_move)
 
+        action_duplicate = QAction("检测重复", self)
+        action_duplicate.triggered.connect(self._find_duplicates)
+        op_menu.addAction(action_duplicate)
+
         # 帮助菜单
         help_menu = menubar.addMenu("帮助")
 
@@ -711,6 +719,11 @@ class DesktopApp(QMainWindow):
         action_move = QAction("移动废片", self)
         action_move.triggered.connect(self._move_defective)
         toolbar.addAction(action_move)
+
+        # 检测重复
+        action_duplicate = QAction("检测重复", self)
+        action_duplicate.triggered.connect(self._find_duplicates)
+        toolbar.addAction(action_duplicate)
 
     def _init_statusbar(self):
         """初始化状态栏"""
@@ -1251,7 +1264,7 @@ class DesktopApp(QMainWindow):
 
         try:
             if sys.platform == "win32":
-                subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", "-R", path])
             else:
@@ -1433,6 +1446,99 @@ class DesktopApp(QMainWindow):
                     self, "移动失败",
                     f"移动废片时出错:\n{mask_path(str(e))}"
                 )
+
+    # --------------------------------------------------------
+    # 检测重复
+    # --------------------------------------------------------
+
+    def _find_duplicates(self):
+        """检测重复照片"""
+        if not self.scan_results:
+            QMessageBox.information(self, "提示", "请先扫描照片")
+            return
+
+        image_paths = list(self.scan_results.keys())
+        if len(image_paths) < 2:
+            QMessageBox.information(self, "提示", "图片数量不足，无法检测重复")
+            return
+
+        self.status_bar.showMessage(f"正在检测 {len(image_paths)} 张图片的重复项...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setMaximum(0)
+
+        def run_duplicate_detection():
+            try:
+                groups = self.classifier.find_duplicates(image_paths)
+                self._on_duplicates_found(groups)
+            except Exception as e:
+                self._on_duplicate_error(str(e))
+
+        import threading
+        thread = threading.Thread(target=run_duplicate_detection, daemon=True)
+        thread.start()
+
+    def _on_duplicates_found(self, groups: list):
+        """重复检测完成回调"""
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximum(1)
+
+        if not groups:
+            QMessageBox.information(self, "检测完成", "未发现重复照片")
+            self.status_bar.showMessage("重复检测完成 - 未发现重复")
+            return
+
+        total_dupes = sum(len(g) for g in groups)
+        msg = f"发现 {len(groups)} 组重复照片，共 {total_dupes} 张：\n\n"
+        for i, group in enumerate(groups, 1):
+            filenames = [os.path.basename(p) for p in group[:3]]
+            extra = f" 等{len(group)}张" if len(group) > 3 else ""
+            msg += f"组{i}: {', '.join(filenames)}{extra}\n"
+
+        msg += "\n是否要移动这些重复照片到废片文件夹？"
+
+        reply = QMessageBox.question(
+            self, "重复检测结果", msg,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+
+        if reply == QMessageBox.Yes:
+            defective_images = {}
+            for group in groups:
+                # 保留第一张，其余标记为重复废片
+                for path in group[1:]:
+                    if path in self.scan_results:
+                        from classifiers.base import DetectionResult, DefectType
+                        defective_images[path] = [DetectionResult(
+                            is_defective=True,
+                            defect_type=DefectType.CORRUPTED,
+                            confidence=1.0,
+                            description="重复照片"
+                        )]
+
+            if defective_images:
+                try:
+                    moved = self.classifier.move_defective(
+                        defective_images, self.current_folder, mode="move"
+                    )
+                    QMessageBox.information(
+                        self, "完成",
+                        f"已移动 {len(moved)} 张重复照片到废片文件夹"
+                    )
+                    self.status_bar.showMessage(f"已移动 {len(moved)} 张重复照片")
+                except Exception as e:
+                    QMessageBox.critical(
+                        self, "移动失败",
+                        f"移动重复照片时出错:\n{mask_path(str(e))}"
+                    )
+
+        self.status_bar.showMessage(f"重复检测完成 - 发现 {len(groups)} 组重复")
+
+    def _on_duplicate_error(self, error_msg: str):
+        """重复检测出错回调"""
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setMaximum(1)
+        QMessageBox.critical(self, "检测出错", f"重复检测出错:\n{mask_path(error_msg)}")
+        self.status_bar.showMessage("重复检测出错")
 
     # --------------------------------------------------------
     # 关于对话框

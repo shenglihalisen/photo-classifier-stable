@@ -30,7 +30,9 @@ def main():
     print("=" * 50)
 
     debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
-    app.run(host="0.0.0.0", port=5000, debug=debug)
+    # 生产环境只监听 localhost，debug 模式可绑定 0.0.0.0
+    host = "0.0.0.0" if debug else "127.0.0.1"
+    app.run(host=host, port=5000, debug=debug)
 
 
 if __name__ == "__main__":

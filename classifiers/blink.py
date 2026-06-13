@@ -19,13 +19,10 @@ import mediapipe as mp
 logger.info(f"MediaPipe 已加载，版本: {mp.__version__}, 平台: {platform.machine()}")
 
 from .base import BaseDetector, DetectionResult, DefectType
-from .utils import FaceLandmarkerFactory
-
-# 图像像素数上限（防止超大图片导致内存溢出）
-MAX_IMAGE_PIXELS = 89478485  # 约 9500x9400
+from .utils import FaceDetectorMixin, MAX_IMAGE_PIXELS
 
 
-class BlinkDetector(BaseDetector):
+class BlinkDetector(BaseDetector, FaceDetectorMixin):
     """
     闭眼检测器
 
@@ -43,32 +40,21 @@ class BlinkDetector(BaseDetector):
     RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
 
     def __init__(self):
-        self._face_landmarker = None
+        self._init_face_detector()
 
     def __del__(self):
-        """释放 FaceLandmarker 资源"""
-        if self._face_landmarker is not None:
-            try:
-                self._face_landmarker.close()
-                logger.info("BlinkDetector: FaceLandmarker 资源已释放")
-            except Exception as e:
-                logger.warning(f"BlinkDetector: 释放 FaceLandmarker 资源时出错: {e}")
-            finally:
-                self._face_landmarker = None
+        self._release_face_detector()
 
     @property
     def defect_type(self) -> DefectType:
         return DefectType.BLINK
 
-    def _get_face_landmarker(self):
-        """获取 FaceLandmarker 实例（使用单例工厂）"""
-        if self._face_landmarker is None:
-            self._face_landmarker = FaceLandmarkerFactory.get_instance()
-        return self._face_landmarker
-
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """检测图片中是否有人闭眼"""
-        img = self.read_image(image_path)
+        if image is None:
+            img = self.read_image(image_path)
+        else:
+            img = image
         if img is None:
             return DetectionResult(
                 is_defective=False,
@@ -78,8 +64,8 @@ class BlinkDetector(BaseDetector):
             )
 
         # 检查图像像素数是否超出限制
-        h, w = img.shape[:2]
-        if h * w > MAX_IMAGE_PIXELS:
+        if not self._check_pixel_limit(img):
+            h, w = img.shape[:2]
             logger.warning(
                 f"图像像素数过大，跳过闭眼检测: {image_path} "
                 f"({w}x{h}={h * w}, 上限={MAX_IMAGE_PIXELS})"

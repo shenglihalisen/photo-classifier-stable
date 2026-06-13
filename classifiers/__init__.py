@@ -7,6 +7,9 @@ from .empty import EmptyDetector
 from .blink import BlinkDetector
 from .blur import BlurDetector
 from .obstruction import ObstructionDetector
+from .exposure import ExposureDetector
+from .noise import NoiseDetector
+from .duplicate import DuplicateDetector
 
 __all__ = [
     "BaseDetector",
@@ -17,4 +20,7 @@ __all__ = [
     "BlinkDetector",
     "BlurDetector",
     "ObstructionDetector",
+    "ExposureDetector",
+    "NoiseDetector",
+    "DuplicateDetector",
 ]

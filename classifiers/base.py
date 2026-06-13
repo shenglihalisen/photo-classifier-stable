@@ -12,8 +12,11 @@ from enum import Enum
 
 logger = logging.getLogger("photo_classifier.base")
 
-# 文件大小上限（100MB）
-MAX_FILE_SIZE = 100 * 1024 * 1024
+# 文件大小上限（10GB）
+MAX_FILE_SIZE = 10 * 1024 * 1024 * 1024
+
+# 图像处理最大边长（超过此值会缩放）
+MAX_PROCESS_DIMENSION = 2048
 
 
 class DefectType(Enum):
@@ -23,6 +26,8 @@ class DefectType(Enum):
     BLINK = "blink"                # 闭眼/眨眼
     BLURRY = "blurry"              # 模糊
     OBSTRUCTION = "obstruction"    # 遮挡
+    EXPOSURE = "exposure"          # 过曝/欠曝
+    NOISY = "noisy"                # 噪点
 
 
 @dataclass
@@ -34,16 +39,53 @@ class DetectionResult:
     description: str                            # 描述信息
 
 
+class PrecomputedImage:
+    """
+    预计算图像数据类
+
+    在 classify() 中一次性计算所有检测器共享的中间结果，
+    避免每个检测器重复计算灰度图、拉普拉斯方差等。
+    """
+
+    __slots__ = ('img', 'gray', 'mean_brightness', 'laplacian_var',
+                 'std_b', 'std_g', 'std_r', 'h', 'w')
+
+    def __init__(self, img):
+        import cv2
+        import numpy as np
+
+        self.img = img
+        self.h, self.w = img.shape[:2]
+
+        # 缩放大图以加速计算
+        if max(self.h, self.w) > MAX_PROCESS_DIMENSION:
+            scale = MAX_PROCESS_DIMENSION / max(self.h, self.w)
+            self.gray = cv2.resize(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), None, fx=scale, fy=scale)
+        else:
+            self.gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 预计算共享值
+        self.mean_brightness = float(np.mean(self.gray))
+        self.laplacian_var = float(cv2.Laplacian(self.gray, cv2.CV_64F).var())
+
+        # 颜色通道标准差（用于空镜/遮挡检测）
+        self.std_b = float(np.std(img[:, :, 0]))
+        self.std_g = float(np.std(img[:, :, 1]))
+        self.std_r = float(np.std(img[:, :, 2]))
+
+
 class BaseDetector(ABC):
     """检测器抽象基类，所有具体检测器必须继承此类"""
 
     @abstractmethod
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """
         检测图片是否存在缺陷
 
         参数:
             image_path: 图片文件路径
+            image: 预加载的 numpy 数组（BGR 格式），为 None 时自行读取
+            precomputed: PrecomputedImage 预计算数据，为 None 时自行计算
 
         返回:
             DetectionResult 检测结果
@@ -67,15 +109,6 @@ class BaseDetector(ABC):
         import cv2
         import numpy as np
         try:
-            # 文件大小检查
-            file_size = os.path.getsize(image_path)
-            if file_size > MAX_FILE_SIZE:
-                logger.warning(
-                    f"文件过大，跳过读取: {image_path} "
-                    f"(大小={file_size / 1024 / 1024:.1f}MB, 上限={MAX_FILE_SIZE / 1024 / 1024:.0f}MB)"
-                )
-                return None
-
             with open(image_path, 'rb') as f:
                 data = np.frombuffer(f.read(), dtype=np.uint8)
             img = cv2.imdecode(data, cv2.IMREAD_COLOR)

@@ -32,31 +32,33 @@ class EmptyDetector(BaseDetector):
     def defect_type(self) -> DefectType:
         return DefectType.EMPTY
 
-    def detect(self, image_path: str) -> DetectionResult:
+    def detect(self, image_path: str, image=None, precomputed=None) -> DetectionResult:
         """检测图片是否为空镜"""
         try:
-            img = self.read_image(image_path)
-            if img is None:
-                return DetectionResult(
-                    is_defective=False,
-                    defect_type=None,
-                    confidence=0.0,
-                    description="无法读取图像，跳过空镜检测"
-                )
+            if precomputed is not None:
+                img = precomputed.img
+                gray = precomputed.gray
+                mean_brightness = precomputed.mean_brightness
+                laplacian_var = precomputed.laplacian_var
+                color_std = (precomputed.std_b + precomputed.std_g + precomputed.std_r) / 3.0
+            else:
+                if image is None:
+                    img = self.read_image(image_path)
+                else:
+                    img = image
+                if img is None:
+                    return DetectionResult(
+                        is_defective=False,
+                        defect_type=None,
+                        confidence=0.0,
+                        description="无法读取图像，跳过空镜检测"
+                    )
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                mean_brightness = float(np.mean(gray))
+                laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                color_std = self._calculate_color_std(img)
 
-            # 转换为灰度图
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-            # 1. 计算灰度均值
-            mean_brightness = float(np.mean(gray))
-
-            # 2. 计算拉普拉斯方差（纹理丰富度）
-            laplacian_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-            # 3. 计算颜色标准差（色彩丰富度）
-            color_std = self._calculate_color_std(img)
-
-            # 4. 计算灰度直方图分布
+            # 灰度直方图分布
             hist_score = self._calculate_histogram_score(gray)
 
             # 综合评分
