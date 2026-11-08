@@ -32,7 +32,7 @@ import (
 )
 
 // 版本号：与 CHANGELOG 对应。
-const version = "v3.3.0"
+const version = "v3.3.1"
 
 func main() {
 	var (
