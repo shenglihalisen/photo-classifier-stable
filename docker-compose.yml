@@ -5,6 +5,10 @@ services:
     container_name: photo-classifier
     ports:
       - "8080:8080"
+    environment:
+      # 强烈建议设置：不设的话程序会随机生成一个并打印到 `docker logs`。
+      # 也可以在 .env 里写 PCP_PASS=你的口令
+      PCP_PASS: ${PCP_PASS:-}
     volumes:
       # 左边换成你的照片目录，右边固定 /data
       - ./photos:/data:ro
