@@ -1,61 +1,12 @@
-# Photo Classifier - Docker Compose 配置
-# 照片自动分类工具 Docker 版本（仅上传模式）
-#
-# 使用方式：
-#   docker compose up -d
-#   浏览器访问 http://localhost:5000
-#
-# 无需挂载本地目录，直接通过Web界面上传照片即可
-
 services:
   photo-classifier:
-    # 直接拉取预构建镜像（无需本地构建）
-    image: ghcr.io/shenglihalisen/photo-classifier-stable:latest
-    container_name: photo-classifier-web
-
-    # 端口映射（可修改左侧端口号）
+    build: .
+    image: photo-classifier-stable:latest
+    container_name: photo-classifier
     ports:
-      - "5000:5000"
-
-    # 环境变量
-    environment:
-      - FLASK_ENV=production
-      # CSRF密钥（生产环境请修改为随机字符串）
-      - CSRF_SECRET_KEY=${CSRF_SECRET_KEY:-photo-classifier-csrf-secret-key-2024}
-      - TZ=Asia/Shanghai
-
-    # 重启策略
+      - "8080:8080"
+    volumes:
+      # 左边换成你的照片目录，右边固定 /data
+      - ./photos:/data:ro
+      # 需要「归档废片」时把 :ro 去掉（会移动文件）
     restart: unless-stopped
-
-    # 健康检查
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/api/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-
-    # 资源限制
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 2G
-        reservations:
-          cpus: '0.5'
-          memory: 512M
-
-    # 安全配置
-    security_opt:
-      - no-new-privileges:true
-
-    # 日志配置
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-networks:
-  default:
-    name: photo-classifier-network
